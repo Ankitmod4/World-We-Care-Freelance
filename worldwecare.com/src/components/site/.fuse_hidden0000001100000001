@@ -1,0 +1,85 @@
+/**
+ * Shell for the legal and information pages — terms, privacy, contact.
+ *
+ * The draft banner is not decoration. The terms and the privacy notice
+ * exist because the signup form links to them, and their content is a
+ * plain-language placeholder written to be replaced — anyone reading
+ * it, member or operator, should be able to tell that at a glance.
+ * Pages that promise nothing (contact) pass `draft={false}`.
+ */
+
+import Link from "next/link";
+import { SiteFooter } from "./site-footer";
+
+export function LegalPage({
+  title,
+  updated,
+  draft = true,
+  children,
+}: {
+  title: string;
+  updated: string;
+  /**
+   * Show the "not written by a lawyer" banner. True for the terms and
+   * the privacy notice, which make promises someone could be held to.
+   * The contact page makes none, so it opts out.
+   */
+  draft?: boolean;
+  children: React.ReactNode;
+}) {
+  return (
+    // Flex column so a short page (contact) still pins the footer to the
+    // bottom of the viewport instead of leaving it a scroll away.
+    <div className="flex min-h-dvh flex-col">
+      <main className="flex-1 bg-[color:var(--color-surface-muted)] px-4 py-10 sm:py-14">
+        <div className="mx-auto max-w-2xl">
+          <Link
+            href="/"
+            className="inline-flex items-center gap-1 text-[13px] font-medium text-[color:var(--color-text-muted)] hover:text-[color:var(--color-brand)]"
+          >
+            <svg width="14" height="14" viewBox="0 0 20 20" fill="none" aria-hidden>
+              <path d="M12 4l-6 6 6 6" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+            Back
+          </Link>
+
+          {draft ? (
+            <div className="mt-4 rounded-2xl border border-[color:var(--color-warning)]/40 bg-[color:var(--color-warning-soft)] p-4">
+              <p className="text-[13px] font-semibold text-[color:var(--color-warning-ink)]">
+                Draft — not legal advice
+              </p>
+              <p className="mt-1 text-[13px] leading-relaxed text-[color:var(--color-warning-ink)]/90">
+                This is placeholder wording so the signup form has something real
+                to link to. It has not been written or reviewed by a lawyer.
+                Replace it before this site takes real sign-ups.
+              </p>
+            </div>
+          ) : null}
+
+          <article className="mt-4 rounded-3xl border border-[color:var(--color-border-soft)] bg-[color:var(--color-surface)] p-6 shadow-card sm:p-8">
+            <h1 className="text-[26px] font-semibold tracking-[-0.02em]">{title}</h1>
+            <p className="mt-1 text-[12.5px] text-[color:var(--color-text-subtle)]">
+              Last updated {updated}
+            </p>
+            <div className="mt-6 space-y-6 text-[14.5px] leading-relaxed text-[color:var(--color-text-muted)]">
+              {children}
+            </div>
+          </article>
+
+        </div>
+      </main>
+      <SiteFooter />
+    </div>
+  );
+}
+
+export function Section({ heading, children }: { heading: string; children: React.ReactNode }) {
+  return (
+    <section>
+      <h2 className="mb-1.5 text-[15.5px] font-semibold text-[color:var(--color-text)]">
+        {heading}
+      </h2>
+      <div className="space-y-2.5">{children}</div>
+    </section>
+  );
+}

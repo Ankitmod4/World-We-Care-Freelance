@@ -1,0 +1,431 @@
+@import "tailwindcss";
+
+/*
+ * Don't scan the scratch folder.
+ *
+ * Tailwind v4 finds its own sources by walking the project, and it does
+ * not care what the extension is — a leftover Python script in
+ * _to_delete/ containing `f"bg-[color:var(--color-{fam})]"` was read as
+ * a class name and emitted invalid CSS (`var(--color-{fam})`), which is
+ * what the "Unexpected token CurlyBracketBlock" warnings at build time
+ * were. .gitignore covers it too; this covers it even when the build
+ * runs somewhere git can't be consulted.
+ */
+@source not "../../_to_delete";
+
+/*
+ * WorldWeCare design tokens.
+ *
+ * WHAT IS WRITTEN HERE IS THE DEFAULT — Sky, in light mode. It is
+ * what public and signed-out pages render, always, and what a
+ * signed-in member sees before they choose anything else.
+ *
+ * A member who has picked one of the other seven themes, or dark
+ * mode, gets these same custom properties redeclared by the <style>
+ * block SiteShell injects. That block lives in the body, after this
+ * stylesheet, so it wins on source order alone — no `!important`, no
+ * heavier selector, nothing to fight. `src/lib/theming.ts` is the
+ * source of truth for all eight sets, and `npm run theme:check`
+ * re-verifies every pair against WCAG AA.
+ *
+ * The consequence worth knowing: NOTHING IN THE APP MAY HARD-CODE A
+ * COLOUR. A `bg-white` survives into dark mode as white. Reach for a
+ * token; if none fits, add one here and in theming.ts together.
+ *
+ * The rest of the look:
+ *   • System font stack — no downloaded web font, so the first paint
+ *     is instant and never shows FOIT.
+ *   • Backdrop blur + translucent surfaces for chrome.
+ *   • Generous radii, Apple's easing — cubic-bezier(0.4, 0, 0.2, 1).
+ */
+
+@theme {
+  /* ── Brand ──────────────────────────────────────────────────── */
+  --color-brand: #1777b8;
+  --color-brand-hover: #005f9e;
+  /*
+   * The label that goes ON the brand fill. NOT a synonym for white:
+   * in dark mode the fill lightens and this becomes near-black. Any
+   * button that hard-codes `text-white` breaks there.
+   */
+  --color-on-brand: #ffffff;
+  --color-brand-soft: #d6efff;
+  --color-brand-tint: #edf8ff;
+  /* Readable ON brand-soft — the colour a chip's label wants. */
+  --color-brand-ink: #005189;
+
+  /* ── Accent ─────────────────────────────────────────────────
+   * The second hue. Every theme has one, deliberately: a single
+   * accent is most of what made the old palette feel flat.
+   */
+  --color-accent: #c47131;
+  --color-on-accent: #ffffff;
+  --color-accent-soft: #ffe7d2;
+  --color-accent-ink: #863f00;
+
+  /* ── Surfaces ───────────────────────────────────────────────
+   * `ground` is the page behind everything; `surface` is a card on
+   * it. In light mode these are DazzlingDish's, to the hex: the page
+   * is Tailwind slate-50, a card is pure white, and a hovered row is
+   * slate-100 — one cool grey ramp shared by all twelve themes, so
+   * the two products sit on the same paper. See note 5 in
+   * src/lib/theming.ts for what that replaced and what it cost.
+   *
+   * In dark mode the relationship inverts: dark cards are LIGHTER
+   * than the page, which is what stops a dark UI reading as a flat
+   * black rectangle. The dark values are still per-theme.
+   */
+  --color-surface: #ffffff;
+  --color-surface-elevated: #ffffff;
+  --color-surface-muted: #f8fafc;
+  --color-surface-hover: #f1f5f9;
+  --color-ground: #f8fafc;
+
+  --color-border: #e2e8f0;
+  --color-border-soft: #f1f5f9;
+  --color-border-strong: #c8d2df;
+
+  --color-text: #0f172a;
+  --color-text-muted: #64748b;
+  --color-text-subtle: #7e8da3;
+
+  /* ── Status ─────────────────────────────────────────────────
+   * NOT themed. These are the same under all eight palettes: an
+   * error re-hued to match a pink theme stops reading as an error.
+   * `soft` is a background, `ink` is the text that goes on it, the
+   * bare name is the solid fill or the icon, and `on-` is the label
+   * that sits on that fill.
+   */
+  --color-success: #1f7a4d;
+  --color-on-success: #ffffff;
+  --color-success-soft: #e3f4ea;
+  --color-success-ink: #155f3b;
+  --color-warning: #96650a;
+  --color-on-warning: #ffffff;
+  --color-warning-soft: #fbeed6;
+  --color-warning-ink: #7a5208;
+  --color-danger: #c4342f;
+  --color-on-danger: #ffffff;
+  --color-danger-soft: #fbe6e4;
+  --color-danger-ink: #9c2621;
+
+  /* ── Radius ─────────────────────────────────────────────────── */
+  --radius-xs: 6px;
+  --radius-sm: 10px;
+  --radius-md: 14px;
+  --radius-lg: 20px;
+  --radius-xl: 28px;
+
+  /* ── Shadow ─────────────────────────────────────────────────
+   * Tinted with the text colour rather than a fixed slate, so a
+   * warm theme's shadows are warm. In dark mode `--shadow-tint` is
+   * re-declared to near-black: a shadow the colour of pale text
+   * would be a glow.
+   */
+  --shadow-card: 0 1px 2px var(--shadow-tint-weak),
+    0 4px 12px var(--shadow-tint-weak);
+  --shadow-elevated: 0 1px 3px var(--shadow-tint-weak),
+    0 12px 32px var(--shadow-tint);
+  --shadow-brand: 0 6px 20px color-mix(in srgb, var(--color-brand) 28%, transparent);
+
+  /* ── Typography ─────────────────────────────────────────────── */
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text",
+    "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono:
+    ui-monospace, "SF Mono", Menlo, Monaco, Consolas, "Liberation Mono",
+    "Courier New", monospace;
+}
+
+:root {
+  /* Mixed from --color-text (slate-900, #0f172a), not a warm brown —
+     a shadow carrying the old #1a1510 would read as a tan halo under
+     a cool grey card. */
+  --shadow-tint: rgba(15, 23, 42, 0.08);
+  --shadow-tint-weak: rgba(15, 23, 42, 0.04);
+}
+
+/* ── Dark mode, the parts that are not per-theme ───────────────
+ *
+ * The eight palettes' dark tokens arrive in the injected block.
+ * What is here instead is everything that is the same whichever
+ * theme you picked: the shadow tint, and `color-scheme`, which is
+ * what makes native scrollbars, date pickers and form controls go
+ * dark. Without it a dark page still scrolls with a white bar.
+ *
+ * Both selectors below match the same way SiteShell's block does —
+ * through `#app-shell`, which exists only on signed-in pages. That
+ * is deliberate: a member who likes dark mode still sees the light
+ * brand on the marketing and login pages, where there is no
+ * preference to read yet and a dark flash would be the only thing
+ * anyone noticed.
+ */
+html:has(#app-shell[data-appearance="dark"]) {
+  color-scheme: dark;
+  --shadow-tint: rgba(0, 0, 0, 0.5);
+  --shadow-tint-weak: rgba(0, 0, 0, 0.3);
+}
+
+@media (prefers-color-scheme: dark) {
+  html:has(#app-shell:not([data-appearance="light"]):not([data-appearance="dark"])) {
+    color-scheme: dark;
+    --shadow-tint: rgba(0, 0, 0, 0.5);
+    --shadow-tint-weak: rgba(0, 0, 0, 0.3);
+  }
+}
+
+/* ── Bottom navigation height ─────────────────────────────────
+ *
+ * One number, declared once, so everything that has to sit above the
+ * mobile tab bar can subtract it: the page's bottom padding, the
+ * full-height chat panes, and the toasts that would otherwise pop up
+ * underneath it. Zero on desktop, where there is no bar — which means
+ * every `calc()` using it is already correct at every width.
+ *
+ * The safe-area inset is what keeps the bar clear of the iPhone home
+ * indicator; on anything else it resolves to 0.
+ */
+:root {
+  --bottom-nav-h: 0px;
+}
+
+@media (max-width: 1023.98px) {
+  :root {
+    --bottom-nav-h: calc(3.5rem + env(safe-area-inset-bottom, 0px));
+  }
+}
+
+/* ── Menu sheet motion ────────────────────────────────────────
+ *
+ * The sheet mounts on open rather than sitting hidden in the DOM, so
+ * the entrance is a plain animation, not a transition — there is no
+ * previous state to transition from. Apple's easing curve, matching
+ * everything else in the app.
+ *
+ * `prefers-reduced-motion` turns the slide off rather than shortening
+ * it: a full-screen panel flying in from the edge is exactly the kind
+ * of movement that setting exists to stop.
+ */
+@keyframes menu-slide-in-left {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+.menu-panel {
+  animation: menu-slide-in-left 240ms cubic-bezier(0.4, 0, 0.2, 1);
+  will-change: transform;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .menu-panel {
+    animation: none;
+  }
+}
+
+/* ── Base ─────────────────────────────────────────────────────── */
+
+html,
+body {
+  height: 100%;
+  background: var(--color-ground);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+*,
+*::before,
+*::after {
+  border-color: var(--color-border);
+}
+
+/* Focus rings — follow the theme's brand */
+*:focus-visible {
+  outline: 2px solid var(--color-brand);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+button,
+[role="button"] {
+  cursor: pointer;
+}
+
+button:disabled,
+[role="button"][aria-disabled="true"] {
+  cursor: not-allowed;
+}
+
+/* ── Utility classes we reach for a lot ───────────────────────── */
+
+/* Apple-style frosted card */
+.card {
+  background: var(--color-surface-elevated);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-card);
+}
+
+.card-elevated {
+  background: var(--color-surface-elevated);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-elevated);
+}
+
+/*
+ * Translucent chrome. `color-mix` against the theme's own surface
+ * rather than a literal white, so this is a frosted pane over a dark
+ * page in dark mode instead of a bright white bar across the top of
+ * it — which is what a hard-coded rgba(255,255,255,.72) would be.
+ */
+.chrome {
+  background: color-mix(in srgb, var(--color-surface) 78%, transparent);
+  backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  border-bottom: 1px solid var(--color-border-soft);
+}
+
+/*
+ * Frosted panes — sticky headers, footers, rails and veils that float
+ * over the page. Same idea as `.chrome`, at two strengths: `.frost`
+ * for something you are meant to see through, `.frost-strong` for
+ * something that only needs to hint at what is behind it.
+ *
+ * `color-mix` against the theme's own surface, so this is a dark
+ * frosted pane in dark mode. The literal `rgba(255,255,255,.8)` these
+ * replaced was a white bar sitting on a dark page.
+ */
+.frost {
+  background: color-mix(in srgb, var(--color-surface) 80%, transparent);
+  backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+}
+
+.frost-strong {
+  background: color-mix(in srgb, var(--color-surface) 94%, transparent);
+  backdrop-filter: saturate(180%) blur(12px);
+  -webkit-backdrop-filter: saturate(180%) blur(12px);
+}
+
+/* Bell-shake animation — triggered on the notification bell when a
+   fresh unread arrives while the tab is focused. Kept short + subtle:
+   three tiny rotations, done in under a second. */
+@keyframes shake {
+  0%, 100% { transform: rotate(0deg); }
+  20% { transform: rotate(-12deg); }
+  40% { transform: rotate(10deg); }
+  60% { transform: rotate(-6deg); }
+  80% { transform: rotate(4deg); }
+}
+
+/* Hide the scrollbar on horizontal-scroll strips (like the settings
+   tab bar). The strip is still scrollable — we just don't want the
+   OS-native scrollbar showing up on Windows / Linux Chromium. */
+.no-scrollbar {
+  scrollbar-width: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+/*
+ * Hero wash — the gradient behind the marketing and login pages.
+ * Mixed from the brand token, so it follows whichever palette is in
+ * force rather than staying the blue it was born as. Public pages
+ * are always the default theme, but the admin previews are not, and
+ * a hero that ignored the preview would make the preview a lie.
+ */
+.hero-sky {
+  background:
+    radial-gradient(
+      circle at 20% -10%,
+      color-mix(in srgb, var(--color-brand) 22%, transparent),
+      transparent 45%
+    ),
+    radial-gradient(
+      circle at 100% 20%,
+      color-mix(in srgb, var(--color-accent) 14%, transparent),
+      transparent 55%
+    ),
+    linear-gradient(
+      180deg,
+      var(--color-brand-tint) 0%,
+      var(--color-surface) 60%
+    );
+}
+
+/* Save-confirmation pop — used by the settings footer. Deliberately
+   re-keyed on every save in React so a second save replays it: the
+   old footer swapped one word of grey text for one word of green,
+   which on a repeat save changed nothing visible at all. */
+@keyframes save-pop {
+  0% { opacity: 0; transform: translateY(4px) scale(0.96); }
+  55% { opacity: 1; transform: translateY(0) scale(1.03); }
+  100% { opacity: 1; transform: translateY(0) scale(1); }
+}
+.animate-save-pop {
+  animation: save-pop 320ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-save-pop {
+    animation: none;
+  }
+}
+
+/* ── the collapsible right rail ─────────────────────────────────
+ *
+ * Driven by `data-rail` on <html>, which layout.tsx sets before the
+ * first paint. Done in CSS rather than React so the rail is already
+ * in the right state when the page appears, instead of snapping shut
+ * a moment after hydration.
+ *
+ * The edge tab is the inverse of the panel: exactly one of the two is
+ * on screen at any width where the rail exists at all. Below xl
+ * neither is — Tailwind's `hidden xl:block` on both handles that, and
+ * these rules only ever turn things OFF, so they cannot resurrect a
+ * rail on a phone.
+ *
+ * `.rail-fallback` is the other half of the story. Anything the rail
+ * carries that a page cannot do without — the crisis card, on the
+ * gratitude and confession walls — has a copy inside the page marked
+ * `xl:hidden`, on the reasoning that the rail is not there below xl.
+ * Collapsing the rail breaks that reasoning at every width, so the
+ * copy has to come back when the rail goes away by choice as well as
+ * by screen size. Without this rule, collapsing the panel on the
+ * confession wall removes the 988 number from the page entirely.
+ */
+[data-rail="collapsed"] .rail-panel {
+  display: none;
+}
+html:not([data-rail="collapsed"]) .rail-tab {
+  display: none;
+}
+@media (min-width: 80rem) {
+  [data-rail="collapsed"] .rail-fallback {
+    display: block;
+  }
+}
+
+/*
+ * A row that scrolls sideways without showing a bar.
+ *
+ * Used by the category tab strip, where a visible scrollbar under a
+ * 36px-tall row of pills doubles its height and reads as a mistake.
+ * The row is still scrollable by wheel, trackpad, touch and keyboard —
+ * this hides the bar, it does not disable the scrolling.
+ */
+.scrollbar-none {
+  scrollbar-width: none;          /* Firefox */
+  -ms-overflow-style: none;       /* old Edge */
+}
+.scrollbar-none::-webkit-scrollbar {
+  display: none;                  /* WebKit */
+}

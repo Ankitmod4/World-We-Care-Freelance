@@ -1,0 +1,3526 @@
+// WorldWeCare — MVP schema.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Admin ────────────────────────────────────────────────────────
+enum AdminRole {
+  OWNER
+  ADMIN
+  MODERATOR
+}
+
+model AdminUser {
+  id           String    @id @default(cuid())
+  email        String    @unique
+  passwordHash String
+  displayName  String
+  role         AdminRole @default(ADMIN)
+  isActive     Boolean   @default(true)
+  lastLoginAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  // Audit trail — every mutation this admin performs on a User row
+  // is recorded here so we can answer "who deactivated this account?"
+  // months later.
+  adminActions AdminActionLog[] @relation("AdminActor")
+
+  // Inbox — one row per admin per notification, so read/unread is
+  // tracked per-admin (as opposed to a shared broadcast).
+  notifications AdminNotification[]
+
+  // Moderation trail — reports this admin has resolved or dismissed.
+  reportsResolved PostReport[] @relation("ReportResolver")
+
+  @@map("admin_users")
+}
+
+// ─── Frontend user ────────────────────────────────────────────────
+model User {
+  id           String  @id @default(cuid())
+  email        String  @unique
+  passwordHash String
+  displayName  String
+  avatarUrl    String?
+  coverUrl     String?
+  bio          String? @db.Text
+  location     String?
+
+  // Anonymous-mode toggle — per-post overrides, this is the default.
+  anonymousByDefault Boolean @default(false)
+
+  // Moderation state.
+  //   • isActive false  → soft-deactivated (account frozen, user can
+  //     no longer sign in, admin can flip back).
+  //   • bannedAt set    → hard-banned; login endpoint rejects with a
+  //     specific error surfaced to the user.
+  isActive  Boolean   @default(true)
+  bannedAt  DateTime?
+
+  /// Denormalised count of UserFollow rows pointing AT this user.
+  ///
+  /// The members directory orders by it, and ordering by a COUNT() in
+  /// another table cannot be paginated with a keyset cursor — every
+  /// page would re-aggregate the whole follow table. Same reason
+  /// Post.likeCount and ChatRoom.memberCount exist.
+  ///
+  /// Maintained in follows.ts (follow/unfollow) and blocks.ts (a block
+  /// severs edges in both directions). `npm run follows:recount`
+  /// rebuilds it from the rows if the two ever drift.
+  followerCount Int @default(0)
+  banReason String?   @db.Text
+
+  // Email verification. Signup can complete without verifying, but
+  // some features (posting to Support-tier rooms, etc.) will gate on
+  // this later.
+  emailVerifiedAt DateTime?
+
+  lastLoginAt DateTime?
+
+  /// Chosen at signup. Loose FK, same as everywhere else — deleting a
+  /// country must not take its members with it. Seeds the country
+  /// picker so a new member's first page is already scoped to them.
+  countryId       String?
+  /// When they ticked the box, not whether. A boolean answers "did
+  /// they agree"; a timestamp answers "when, and so to which version" —
+  /// the only form of the question anyone asks later.
+  termsAcceptedAt DateTime?
+
+  /// Anyone can go live. This is the off switch for ONE person, used
+  /// by a moderator — not a permission anybody has to earn.
+  canStream Boolean @default(true)
+
+  /// Appearance. Both nullable, and null is the answer for "never
+  /// chose", not a broken row — a member who has touched neither gets
+  /// the default palette and follows their OS for light/dark.
+  ///
+  /// Stored as plain strings rather than enums on purpose: adding a
+  /// ninth palette should be an edit to src/lib/theming.ts and nothing
+  /// else. Nothing reads these values directly — `getTheme()` and
+  /// `parseAppearanceMode()` both fall back on anything they don't
+  /// recognise, so a stale id left behind by a removed theme renders
+  /// as the default instead of as a crash.
+  ///
+  /// Named `colorThemeId`, not `themeId`, because `themeId` already
+  /// means a LibraryTheme everywhere else in this schema — a content
+  /// taxonomy that has nothing to do with colour.
+  colorThemeId   String? @db.VarChar(32)
+  /// "light" | "dark" | "system" | null.
+  ///
+  /// All three choices are stored as themselves. NULL is the fourth
+  /// state and the important one: it means the member has NEVER
+  /// CHOSEN, and resolves to whatever `DEFAULT_APPEARANCE_MODE` in
+  /// src/lib/theming.ts currently says — dark, today.
+  ///
+  /// So NULL is not a synonym for "system". Somebody who deliberately
+  /// picks Auto is written down as "system" and keeps following their
+  /// device even if the app default changes; somebody who never
+  /// opened the menu moves with it. Collapsing the two, which this
+  /// column briefly did, makes the second impossible to tell from the
+  /// first.
+  appearanceMode String? @db.VarChar(8)
+  /// How deep the chosen theme's brand colour runs — 0 lightest, 4
+  /// darkest, 2 the default. A second axis on colorThemeId rather than
+  /// twelve more themes: see the tone note in src/lib/theming.ts.
+  brandTone      Int     @default(2)
+
+  /// An address the member has asked to move to, not yet confirmed.
+  /// It sits here — not in `email` — until they click the link sent to
+  /// it, so a typo cannot lock them out of their own account and a
+  /// borrowed session cannot quietly take it over.
+  pendingEmail String?
+
+  /// Session cut-off. Any cookie issued before this instant is dead.
+  ///
+  /// Sessions are signed tokens rather than rows in a table, so there
+  /// is nothing to delete when someone needs to be signed out of a
+  /// device they no longer control. One timestamp does the job for all
+  /// of them at once: the token already carries when it was issued, so
+  /// the check is a comparison, not a lookup.
+  ///
+  /// Null means never revoked, which is every account until the first
+  /// password change.
+  sessionsValidFrom DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // ── progress & personal growth (plan.docx §4) ──
+  // ── on badges and streaks ──
+  // Badges are simply public. There is no column for hiding them,
+  // because there is no switch: they are recognition — "said hello",
+  // "showed up" — and none of it discloses anything a member would
+  // not say out loud. A flag nothing sets is just a thing to get
+  // wrong later.
+  //
+  // STREAKS ARE THE OPPOSITE, and that asymmetry is the whole design.
+  // "Days sober" on a public profile discloses an addiction to every
+  // member, so each streak carries its own `isPublic`, off until the
+  // member ticks it — plan.docx §4: "visible to the user always, and
+  // to others only if the user wants".
+
+  /// The daily digest. Opt-in, per the plan — an email nobody asked
+  /// for is not a kindness.
+  digestEnabled Boolean @default(false)
+  /// Local hour, 0-23, in `timezone`.
+  digestHour    Int     @default(8)
+  /// IANA name, e.g. "Europe/Dublin". Null means UTC, which is why the
+  /// digest asks for it the first time somebody turns this on.
+  timezone      String? @db.VarChar(64)
+  /// The last LOCAL date a digest went out, so a runner that fires
+  /// every hour cannot send twice in one day.
+  digestLastSentOn DateTime? @db.Date
+
+  // Relations
+  streaks            UserStreak[]
+  badges             UserBadge[]
+  activities         UserActivity[]
+  adminActions       AdminActionLog[]    @relation("AdminActionTarget")
+  verificationTokens VerificationToken[]
+  posts              Post[]              @relation("PostAuthor")
+  comments           PostComment[]       @relation("CommentAuthor")
+  likes              PostLike[]
+  saves              PostSave[]
+  reportsFiled       PostReport[]        @relation("Reporter")
+  dailyReflections   DailyReflection[]
+  /// Stored payout details are personal data with no value to us once
+  /// the account is gone — cascade so deletion actually deletes them.
+  /// Donation and Payout rows deliberately do NOT cascade: they are
+  /// financial records and must outlive the account.
+  payoutMethods      PayoutMethod[]      @relation("UserPayoutMethods")
+
+  @@index([isActive, bannedAt])
+  @@index([email])
+  @@index([countryId])
+  /// The members directory's sort key. Leading column matches the
+  /// WHERE, trailing column the ORDER BY, so a page is one range scan.
+  @@index([isActive, bannedAt, followerCount])
+  @@map("users")
+}
+
+// ─── Verification tokens ─────────────────────────────────────────
+// One-time tokens for email confirmation + password reset. Same
+// table for both — the `purpose` enum keeps them distinct so a
+// leaked confirm token can't be used to reset a password.
+//
+// Tokens are opaque 64-char hex strings. Stored in plaintext for now
+// (short-lived + purpose-scoped + single-use); we'll move to hashed
+// storage if the threat model changes.
+enum VerificationPurpose {
+  /// A requested new address, waiting to be confirmed from that
+  /// address before it replaces the old one.
+  EMAIL_CHANGE
+  EMAIL_CONFIRM
+  PASSWORD_RESET
+}
+
+model VerificationToken {
+  id        String              @id @default(cuid())
+  token     String              @unique
+  userId    String
+  purpose   VerificationPurpose
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime            @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Look-up index used every request the /verify page handles.
+  @@index([userId, purpose])
+  // For a periodic cleanup job to prune expired-and-used rows.
+  @@index([expiresAt])
+  @@map("verification_tokens")
+}
+
+// ─── User activity log ───────────────────────────────────────────
+// A user's own event trail: signed up, signed in, verified email,
+// changed password, etc. Powers the "Activity" tab on the admin
+// detail page and eventually the user's own "account timeline".
+// Keep the enum tight — every new value needs schema migration.
+enum UserActivityType {
+  SIGNED_UP
+  SIGNED_IN
+  SIGN_IN_FAILED
+  EMAIL_VERIFIED
+  PASSWORD_CHANGED
+  PROFILE_UPDATED
+  ADMIN_ACTION // umbrella for anything an admin did (deactivate, ban…)
+}
+
+model UserActivity {
+  id        String           @id @default(cuid())
+  userId    String
+  type      UserActivityType
+  // Short human-readable summary shown in the activity feed.
+  message   String
+  // Optional structured metadata (e.g. { "from": "old@x.com", "to": "new@x.com" }).
+  meta      Json?
+  createdAt DateTime         @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([type])
+  @@map("user_activities")
+}
+
+// ─── Admin action log ────────────────────────────────────────────
+// Records mutations admins perform on other rows (users first,
+// posts / articles later). Kept separate from UserActivity so the
+// admin trail can't be shown to the user by accident.
+enum AdminAction {
+  USER_UPDATED
+  USER_ACTIVATED
+  USER_DEACTIVATED
+  USER_BANNED
+  USER_UNBANNED
+  USER_DELETED
+  USER_PASSWORD_RESET_SENT
+  USER_EMAIL_SENT
+  USER_CREATED
+  POST_REMOVED
+  POST_RESTORED
+  POST_FEATURED
+  POST_UNFEATURED
+  COMMENT_REMOVED
+  COMMENT_RESTORED
+  REPORT_RESOLVED
+  REPORT_DISMISSED
+  // ── Money ──
+  // Reading a member's bank details is logged as deliberately as
+  // moving the money is: it is the one action here that exposes
+  // personal data rather than changing a status.
+  PAYOUT_APPROVED
+  PAYOUT_PAID
+  PAYOUT_REJECTED
+  /// A payout marked PAID in error, or one the bank sent back.
+  PAYOUT_REVERSED
+  PAYOUT_DETAILS_VIEWED
+  PAYMENT_SETTINGS_UPDATED
+}
+
+model AdminActionLog {
+  id           String      @id @default(cuid())
+  adminId      String
+  // What was acted on. Every field except `action` and `createdAt` is
+  // optional so the log stays useful once we add non-user targets.
+  action       AdminAction
+  targetUserId String?
+  // Free-form JSON snapshot of the change (before/after values,
+  // reason strings, etc.). Never write PII we don't already have.
+  meta         Json?
+  reason       String?     @db.Text
+  createdAt    DateTime    @default(now())
+
+  admin      AdminUser @relation("AdminActor", fields: [adminId], references: [id], onDelete: Cascade)
+  targetUser User?     @relation("AdminActionTarget", fields: [targetUserId], references: [id], onDelete: SetNull)
+
+  @@index([adminId, createdAt])
+  @@index([targetUserId, createdAt])
+  @@index([action])
+  @@map("admin_action_logs")
+}
+
+// ─── Admin notifications ─────────────────────────────────────────
+// Fan-out inbox: when something notable happens we create one row
+// per active admin so read/unread is per-person. Trade-off:
+// slightly more writes vs a simpler read path (no join to
+// AdminNotificationRead table). At WWC scale this is a rounding
+// error.
+enum AdminNotifType {
+  USER_SIGNED_UP
+  USER_EMAIL_VERIFIED
+  USER_BANNED
+  USER_DELETED
+  POST_REPORTED
+  POST_REMOVED
+  CONFESSION_PENDING
+  EVENT_PENDING
+  PLACE_PENDING
+  PLACE_REPORTED
+  PETITION_PENDING
+  CAMPAIGN_PENDING
+  // Room to grow — chatroom flagged, panic-button, etc.
+}
+
+model AdminNotification {
+  id        String         @id @default(cuid())
+  adminId   String
+  type      AdminNotifType
+  title     String
+  message   String?        @db.Text
+  // Optional deep-link that opens when the admin clicks the notif.
+  // Kept as a plain string (not a strict type) so future notif kinds
+  // can point anywhere without schema changes.
+  actionUrl String?
+  readAt    DateTime?
+  createdAt DateTime       @default(now())
+
+  admin AdminUser @relation(fields: [adminId], references: [id], onDelete: Cascade)
+
+  // Composite index optimised for the two hot queries: "how many
+  // unread do I have?" and "give me my last 20".
+  @@index([adminId, readAt, createdAt])
+  @@map("admin_notifications")
+}
+
+// ─── Community wall (posts) ──────────────────────────────────────
+// A Post is a single wall entry — text, optional images, tied to
+// an author. Comments hang off Post via PostComment. Likes/saves
+// are per-user join tables so counts stay accurate under concurrent
+// writes (denorm'd counters would drift).
+//
+// Anonymous mode: when isAnonymous=true, the reader UI shows
+// "Anonymous member" instead of the author's name — but the FK is
+// preserved so moderators can still see who wrote it.
+//
+// Author snapshot: authorNameSnapshot captures the display name at
+// posting time. If the author later renames or deletes their
+// account, the wall doesn't turn into a page of "Deleted user"
+// rows for content that was fine when it was posted.
+enum PostStatus {
+  PUBLISHED
+  PENDING // held for moderator review (support-tier rooms later)
+  REMOVED // hidden by a moderator; author sees a "removed" chip
+  DRAFT // author saved but hasn't posted yet
+}
+
+model Post {
+  id                   String     @id @default(cuid())
+  authorId             String? // nullable so hard-deleting the user doesn't nuke posts
+  authorNameSnapshot   String // "Sarah" — shown when the author row is gone
+  authorAvatarSnapshot String?
+  body                 String     @db.Text
+  images               Json? // [{ url, alt?, width?, height? }]
+  // One converted video per post: { assetId, url, posterUrl, width,
+  // height, durationSec }. Written from a READY VideoAsset owned by
+  // the author — never from a URL the client supplies, or anyone
+  // could point a post at any file on the server.
+  video                Json?
+  isAnonymous          Boolean    @default(false)
+  status               PostStatus @default(PUBLISHED)
+  removedReason        String?    @db.Text
+
+  // Denorm counters — cheap for the feed, refreshed on write.
+  likeCount    Int @default(0)
+  commentCount Int @default(0)
+  saveCount    Int @default(0)
+  reportCount  Int @default(0)
+
+  // isFeatured surfaces a post on the homepage even when it's
+  // older than the feed cutoff.
+  isFeatured Boolean   @default(false)
+  featuredAt DateTime?
+
+  // Optional country scope so a post can be filtered to
+  // someone's local feed.
+  countryId String?
+  country   Country? @relation(fields: [countryId], references: [id], onDelete: SetNull)
+
+  author User? @relation("PostAuthor", fields: [authorId], references: [id], onDelete: SetNull)
+
+  comments PostComment[]
+  likes    PostLike[]
+  saves    PostSave[]
+  reports  PostReport[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, createdAt])
+  @@index([authorId, createdAt])
+  @@index([countryId, status, createdAt])
+  @@index([isFeatured, featuredAt])
+  @@map("posts")
+}
+
+model PostComment {
+  id                   String     @id @default(cuid())
+  postId               String
+  authorId             String?
+  authorNameSnapshot   String
+  authorAvatarSnapshot String?
+  body                 String     @db.Text
+  isAnonymous          Boolean    @default(false)
+  status               PostStatus @default(PUBLISHED)
+  removedReason        String?    @db.Text
+  /// Was declared long before anything wrote it. Reactions are what
+  /// finally fill it in — recounted from the rows, never incremented.
+  likeCount            Int        @default(0)
+  reactions            PostCommentReaction[]
+  reportCount          Int        @default(0)
+
+  post   Post  @relation(fields: [postId], references: [id], onDelete: Cascade)
+  author User? @relation("CommentAuthor", fields: [authorId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([postId, createdAt])
+  @@index([status])
+  @@map("post_comments")
+}
+
+/// How somebody answered a post.
+///
+/// SIX, AND THEY ARE NOT FACEBOOK'S SIX. This is a place where people
+/// write about relapses, bad weeks and things they have never told
+/// anyone, so the set is the things you would actually want said back
+/// to you. There is no "angry" and no "sad" — a frowning face under
+/// somebody's worst day reads as agreement that it is hopeless, and
+/// nobody needs that from a stranger.
+///
+/// SAME is the important one. "Me too" is the whole ladder in
+/// plan.docx §2 — the first thing a frightened person needs is
+/// evidence they are not the only one, and a reaction says it without
+/// requiring them to write a reply they are not ready to write.
+///
+/// SHARED BY EVERY SURFACE that carries reactions — posts,
+/// confessions, gratitude entries, articles, clips and petitions.
+/// The name is a Prisma-level type only: MySQL renders it inline on
+/// each column, so renaming it here changes no SQL.
+enum Reaction {
+  LIKE
+  HEART
+  CARE
+  STRENGTH
+  PROUD
+  SAME
+}
+
+/// One row per person per post, whatever the reaction.
+///
+/// The reaction lives HERE rather than in its own table, so
+/// `Post.likeCount` keeps meaning "how many people responded" without
+/// a second counter to drift out of step, and changing your mind from
+/// 👍 to 🤗 moves a row rather than adding one. It is still called
+/// `post_likes` because renaming a table to rename a concept costs a
+/// migration and buys nothing.
+model PostLike {
+  postId    String
+  userId    String
+  type      Reaction @default(LIKE)
+  createdAt DateTime     @default(now())
+
+  post Post @relation(fields: [postId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([postId, userId])
+  @@index([userId, createdAt])
+  @@map("post_likes")
+}
+
+model PostSave {
+  postId    String
+  userId    String
+  createdAt DateTime @default(now())
+
+  post Post @relation(fields: [postId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([postId, userId])
+  @@index([userId, createdAt])
+  @@map("post_saves")
+}
+
+// ─── Reports ─────────────────────────────────────────────────────
+// One report per (target, reporter). Multiple reports on the same
+// target roll up in the admin queue by targetId. Same table is
+// used for posts and comments so the moderator inbox is a single
+// view — targetType tells you which one.
+enum ReportTargetType {
+  POST
+  COMMENT
+}
+
+enum ReportStatus {
+  OPEN
+  RESOLVED
+  DISMISSED
+}
+
+enum ReportReason {
+  SPAM
+  HARASSMENT
+  HATE_SPEECH
+  SELF_HARM // triage separately — crisis flow later
+  ADULT_CONTENT
+  MISINFORMATION
+  OFF_TOPIC
+  OTHER
+}
+
+model PostReport {
+  id           String           @id @default(cuid())
+  targetType   ReportTargetType
+  postId       String // always set (comments carry their post too for the join)
+  commentId    String?
+  reporterId   String? // nullable so deleting the reporter keeps the report row
+  reason       ReportReason
+  notes        String?          @db.Text
+  status       ReportStatus     @default(OPEN)
+  resolvedById String?
+  resolvedAt   DateTime?
+  resolution   String?          @db.Text
+  createdAt    DateTime         @default(now())
+
+  /// "POST:<postId>" or "COMMENT:<commentId>" WHILE THE REPORT IS OPEN,
+  /// and null once it is resolved or dismissed. That is the whole
+  /// trick: MySQL treats NULLs in a unique index as distinct, so the
+  /// @@unique below stops one person filing the same open report twice
+  /// (a double-click used to create two rows and bump reportCount
+  /// twice — findFirst-then-create is a race with nothing behind it),
+  /// while still letting them report the same thing again later if it
+  /// comes back. A nullable reporterId behaves the same way, so the
+  /// rows orphaned by an account deletion never collide either.
+  openKey String?
+
+  post       Post       @relation(fields: [postId], references: [id], onDelete: Cascade)
+  reporter   User?      @relation("Reporter", fields: [reporterId], references: [id], onDelete: SetNull)
+  resolvedBy AdminUser? @relation("ReportResolver", fields: [resolvedById], references: [id], onDelete: SetNull)
+
+  @@unique([reporterId, openKey])
+  @@index([status, createdAt])
+  @@index([postId])
+  @@index([targetType, status, createdAt])
+  @@index([reporterId, createdAt])
+  @@map("post_reports")
+}
+
+// ─── Geography ───────────────────────────────────────────────────
+// Four-level hierarchy: Region → SubRegion → Country → State.
+// States exist only for the United States (per product decision) —
+// enforced in the lib layer, not at the DB level, so future
+// expansions (Canada provinces, Mexican estados) don't need a
+// migration.
+//
+// UN M49 is the source of truth for regions/sub-regions. ISO 3166-1
+// alpha-2 for countries. USPS two-letter codes for US states.
+model Region {
+  id        String   @id @default(cuid())
+  slug      String   @unique // "africa"
+  name      String // "Africa"
+  code      String   @unique // UN M49, e.g. "002"
+  sortOrder Int      @default(0)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  subRegions SubRegion[]
+
+  @@index([isActive, sortOrder])
+  @@map("regions")
+}
+
+model SubRegion {
+  id        String   @id @default(cuid())
+  regionId  String
+  slug      String   @unique // "northern-africa"
+  name      String // "Northern Africa"
+  code      String   @unique // UN M49, e.g. "015"
+  sortOrder Int      @default(0)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  region    Region    @relation(fields: [regionId], references: [id], onDelete: Cascade)
+  countries Country[]
+
+  @@index([regionId, sortOrder])
+  @@index([isActive])
+  @@map("sub_regions")
+}
+
+model Country {
+  id          String   @id @default(cuid())
+  subRegionId String
+  slug        String   @unique // "united-states"
+  name        String // "United States"
+  code        String   @unique // ISO 3166-1 alpha-2, e.g. "US"
+  code3       String?  @unique // ISO 3166-1 alpha-3, e.g. "USA"
+  numericCode String? // ISO 3166-1 numeric, e.g. "840"
+  flagUrl     String?  @db.Text
+  emojiFlag   String? // "🇺🇸" for cheap chip rendering
+  phoneCode   String? // "+1"
+  currency    String? // "USD"
+  language    String? // primary language name
+  sortOrder   Int      @default(0)
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  subRegion SubRegion @relation(fields: [subRegionId], references: [id], onDelete: Cascade)
+  states    State[]
+  posts     Post[]
+
+  @@index([subRegionId, name])
+  @@index([isActive])
+  @@map("countries")
+}
+
+model State {
+  id        String   @id @default(cuid())
+  countryId String
+  slug      String // unique per country, not globally
+  name      String // "California"
+  code      String // USPS two-letter, e.g. "CA"
+  capital   String?
+  sortOrder Int      @default(0)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  country Country @relation(fields: [countryId], references: [id], onDelete: Cascade)
+
+  @@unique([countryId, slug])
+  @@unique([countryId, code])
+  @@index([countryId, name])
+  @@index([isActive])
+  @@map("states")
+}
+
+// ─── Settings ─────────────────────────────────────────────────────
+/// Which way a language runs. Arabic, Hebrew, Persian and Urdu run
+/// right to left, and that is a LAYOUT fact, not a text one: the rails
+/// swap sides, the tab strip scrolls the other way and every
+/// directional margin mirrors. Stored per locale so the shell can set
+/// `dir` from data rather than from a hardcoded list of four codes
+/// somebody will forget to update.
+enum TextDirection {
+  LTR
+  RTL
+}
+
+/// Where a translation came from, which is the only thing that tells
+/// you whether to trust it.
+enum TranslationSource {
+  /// Machine output, unreviewed. Fine for a button, risky for anything
+  /// a person in distress reads.
+  GOOGLE
+  /// Typed or corrected by a person.
+  HUMAN
+}
+
+/// A language the site can be shown in.
+///
+/// ROWS EXIST FOR LANGUAGES THAT ARE MERELY AVAILABLE, not only for
+/// the ones switched on — `isEnabled` is what the member-facing
+/// picker reads. Google supports around 130 and a picker listing all
+/// of them is not a picker, so the team turns on the few they can
+/// actually stand behind and the rest sit here ready.
+model Locale {
+  /// BCP-47, as Google returns it: "es", "hi", "pt-BR".
+  code String @id @db.VarChar(16)
+
+  /// English name, for the admin list.
+  name       String        @db.VarChar(80)
+  /// The language's name in itself — "Espanol", "Hindi" in Devanagari.
+  /// What the member-facing picker shows, because somebody looking for
+  /// their own language is not scanning for the English word for it.
+  nativeName String        @db.VarChar(80)
+  direction  TextDirection @default(LTR)
+
+  /// Off until somebody turns it on. English is the source and is
+  /// always enabled; everything else starts dark.
+  isEnabled Boolean @default(false)
+  sortOrder Int     @default(0)
+
+  translations Translation[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([isEnabled, sortOrder])
+  @@map("locales")
+}
+
+/// One piece of interface text, in English.
+///
+/// THE ENGLISH LIVES HERE, not in a `messages/en.json`, because the
+/// admin page is the thing that manages translations and a catalogue
+/// split between a file and a table is one somebody will let drift.
+/// `scripts/extract-strings.ts` fills this from the codebase.
+model TranslationString {
+  id String @id @default(cuid())
+
+  /// Dotted and stable: "campaigns.browseBySection". The code asks for
+  /// this, so renaming one is a code change, not a data edit.
+  key     String @unique @db.VarChar(200)
+  /// The source text. Changing it should un-review every translation
+  /// of it — see `sourceHash`.
+  english String @db.Text
+
+  /// A hash of `english` at the time each translation was made. When
+  /// the English changes this stops matching and the admin list can
+  /// show "the original moved" rather than silently serving a
+  /// translation of a sentence that no longer exists.
+  sourceHash String @db.VarChar(64)
+
+  /// Where it appears, so whoever is translating "Open" knows whether
+  /// it is a door or a petition.
+  context String? @db.VarChar(300)
+
+  translations Translation[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([key])
+  @@map("translation_strings")
+}
+
+/// One string, in one language.
+model Translation {
+  id String @id @default(cuid())
+
+  stringId String
+  string   TranslationString @relation(fields: [stringId], references: [id], onDelete: Cascade)
+
+  localeCode String
+  locale     Locale @relation(fields: [localeCode], references: [code], onDelete: Cascade)
+
+  value  String            @db.Text
+  source TranslationSource @default(GOOGLE)
+
+  /// The English this was translated FROM. Compared against the
+  /// string's current `sourceHash` to spot a translation that has been
+  /// left behind by an edit to the original.
+  sourceHash String @db.VarChar(64)
+
+  /// Set when a person has read it and is happy. Machine output with
+  /// no review is still shown — a rough translation beats an English
+  /// sentence somebody cannot read — but the admin list says which.
+  reviewedAt        DateTime?
+  reviewedByAdminId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([stringId, localeCode])
+  @@index([localeCode, source])
+  @@map("translations")
+}
+
+/// ─── Translated member content ────────────────────────────────
+///
+/// The interface catalogue above is a fixed set of English strings an
+/// admin curates. THIS IS THE OPPOSITE: unbounded text people wrote,
+/// in whatever language they wrote it, translated on demand and kept
+/// so it is paid for once.
+///
+/// WHY A CACHE AND NOT A COLUMN ON EACH TABLE. A post can need a
+/// dozen languages and a room name needs one row per language too;
+/// columns would mean a migration per language. This is one table,
+/// keyed by what it points at.
+///
+/// `sourceHash` IS THE EDIT DETECTOR. When somebody edits a post the
+/// hash stops matching and the stored translation is ignored — a
+/// reader never sees a translation of a sentence that was taken back.
+model ContentTranslation {
+  id String @id @default(cuid())
+
+  /// What it points at: "post", "comment", "confession", "room".
+  kind  String @db.VarChar(24)
+  refId String @db.VarChar(64)
+  /// Which field of it: "body", "title", "name".
+  field String @db.VarChar(24)
+
+  localeCode String @db.VarChar(16)
+
+  /// The text this was translated FROM.
+  sourceHash String @db.VarChar(64)
+  value      String @db.Text
+
+  /// What the translator thought the original was, when it said. Shown
+  /// nowhere; kept because "translated from Polish" is the first thing
+  /// anybody asks when a translation reads oddly.
+  detected String? @db.VarChar(16)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([kind, refId, field, localeCode])
+  @@index([localeCode])
+  @@map("content_translations")
+}
+
+model PlatformSetting {
+  key       String   @id
+  group     String
+  value     Json
+  updatedAt DateTime @updatedAt
+
+  @@index([group])
+  @@map("platform_settings")
+}
+
+// ─── Daily reflection ────────────────────────────────────────────
+// These are intentionally separate records rather than free-form settings:
+// the team can prepare content ahead of time and retain a clear history.
+model DailyQuote {
+  id          String   @id @default(cuid())
+  body        String   @db.Text
+  attribution String?  @db.Text
+  displayDate DateTime @unique @db.Date
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([isActive, displayDate])
+  @@map("daily_quotes")
+}
+
+model DailyQuestion {
+  id          String            @id @default(cuid())
+  body        String            @db.Text
+  displayDate DateTime          @unique @db.Date
+  isActive    Boolean           @default(true)
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+  reflections DailyReflection[]
+
+  @@index([isActive, displayDate])
+  @@map("daily_questions")
+}
+
+// THE PRIVATE JOURNAL. "A private space to write what they can't say
+// out loud yet. Only the user sees it." — plan.docx §4.
+//
+// This was the answer to the daily question and nothing else. It is
+// now the journal, because the two are the same act: a member writing
+// something down that nobody else will read. Making a second table for
+// free-form entries would have meant two ideas of "private writing",
+// two privacy rules to keep in step, and the day somebody filters one
+// of them wrong.
+//
+// PRIVACY IS STRUCTURAL, NOT A FLAG. There is no `isPrivate` column to
+// forget in a `where`: nothing reads this table except the owner's own
+// queries, and `sharedPostId` is the only way a word of it reaches
+// anyone else — set explicitly, by the member, one entry at a time.
+model DailyReflection {
+  id     String @id @default(cuid())
+  userId String
+  /// Optional now. Set when the entry answers that day's question,
+  /// null when the member just wrote something.
+  questionId String?
+  body       String  @db.Text
+
+  /// The post created when the member chose to share this entry.
+  /// Non-null means those words are public; it is never set by
+  /// anything but an explicit share.
+  sharedPostId String?
+  sharedAt     DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user     User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  question DailyQuestion? @relation(fields: [questionId], references: [id], onDelete: SetNull)
+
+  /// Still one answer per question. MySQL allows many NULLs in a
+  /// unique index, so free-form entries do not collide.
+  @@unique([userId, questionId])
+  @@index([questionId])
+  /// The journal itself: a member's entries, newest first.
+  @@index([userId, createdAt])
+  @@map("daily_reflections")
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// PROGRESS & PERSONAL GROWTH
+//
+// "Small wins matter. WorldWeCare tracks a user's personal journey so
+// they can look back and see how far they've come." — plan.docx §4.
+// ═══════════════════════════════════════════════════════════════════
+
+enum StreakKind {
+  SOBER
+  MEDITATION
+  VOLUNTEERING
+  JOURNALING
+  /// The member names it themselves — "days since I called my mum".
+  CUSTOM
+}
+
+/// A count of days since a date the member declared.
+///
+/// COUNTED FROM A DATE, NOT FROM CHECK-INS. A daily "yes, today too"
+/// button would mean a number that matters enormously to somebody
+/// silently resetting because they had a bad week and did not open an
+/// app. A declared date counts itself, works retroactively, and asks
+/// nothing of a person on the days they have least to give.
+///
+/// A RESET IS ALWAYS THE MEMBER'S OWN ACT. Nothing here expires,
+/// lapses, or breaks on its own. `bestDays` keeps the longest run so
+/// that starting again does not erase what was already done — which is
+/// the whole reason somebody can bear to press the button.
+model UserStreak {
+  id     String     @id @default(cuid())
+  userId String
+  kind   StreakKind
+  /// Required when kind is CUSTOM, ignored otherwise.
+  label  String?    @db.VarChar(80)
+
+  /// A DATE, not a timestamp — "3 March", not "3 March 00:00 UTC".
+  startedOn DateTime @db.Date
+
+  /// ON by default for anything created from now on — see
+  /// `startStreak`, where the composer shows the tick before saving.
+  ///
+  /// The column default is deliberately NOT a migration of existing
+  /// rows: a member who started a streak while the default was
+  /// private keeps it private. Changing a default changes what
+  /// happens next; publishing somebody's sobriety count retroactively
+  /// would be a different thing entirely, and is not what this does.
+  isPublic Boolean @default(true)
+
+  /// The longest run so far, kept across resets.
+  bestDays   Int       @default(0)
+  resetCount Int       @default(0)
+  /// Stopped tracking. Kept rather than deleted so the history is not
+  /// lost the moment somebody tidies up.
+  archivedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, archivedAt])
+  @@map("user_streaks")
+}
+
+/// An earned milestone.
+///
+/// The definitions live in `src/lib/badges.ts`, not in the database:
+/// a badge is a rule about facts, and a rule belongs in code where it
+/// can be read and tested. This table records only that a given member
+/// met a given rule, and when.
+model UserBadge {
+  id     String @id @default(cuid())
+  userId String
+  /// Matches a slug in the code registry. Kept as a string so an
+  /// unknown or retired badge degrades to "not shown" rather than
+  /// breaking a profile.
+  slug   String @db.VarChar(60)
+
+  earnedAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, slug])
+  @@index([userId, earnedAt])
+  @@map("user_badges")
+}
+
+// ─── Email templates ─────────────────────────────────────────────
+model EmailTemplate {
+  id          String   @id @default(cuid())
+  slug        String   @unique
+  name        String
+  description String?  @db.Text
+  subject     String
+  previewText String?
+  htmlBody    String   @db.LongText
+  textBody    String?  @db.Text
+  variables   Json?
+  enabled     Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("email_templates")
+}
+
+// ─── Email logs ──────────────────────────────────────────────────
+enum EmailStatus {
+  QUEUED
+  SENT
+  FAILED
+}
+
+model EmailLog {
+  id           String      @id @default(cuid())
+  templateSlug String?
+  toEmail      String
+  fromEmail    String
+  subject      String
+  status       EmailStatus @default(QUEUED)
+  providerId   String?
+  errorMessage String?     @db.Text
+  sentAt       DateTime?
+  createdAt    DateTime    @default(now())
+
+  @@index([status, createdAt])
+  @@index([toEmail])
+  @@index([templateSlug])
+  @@map("email_logs")
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// CHATROOMS
+// The heart of the platform (see plan.docx). Four tiers:
+//   PUBLIC  — anyone can read + post
+//   SUPPORT — join, first post approved by a moderator
+//   CRISIS  — trained responders only (panic button lands in Wave 2)
+//   CAVALRY — verified members, real-world action (Wave 3)
+// Authors are stored as scalar ids + name/avatar snapshots (same
+// pattern as Post) so deleting a user never blanks a thread and we
+// avoid back-relations on the core User model.
+
+// ═══════════════════════════════════════════════════════════════════
+// PETITIONS
+//
+// "Users can start or sign petitions against corruption or in support
+// of a good cause. Signature count is public." — plan.docx §4.
+//
+// THE COUNT IS THE WHOLE PRODUCT. A petition is a number held up in
+// public, and a number anyone can inflate is worth nothing — so a
+// signature is one row keyed on (petition, user), signing requires an
+// account, and the count is derived from those rows rather than
+// incremented freely.
+//
+// Moderation follows Event exactly: a member submits, it sits PENDING
+// until an admin approves it. A platform that lets anyone publish an
+// accusation against a named person or business, instantly and at
+// scale, is a defamation surface rather than a campaigning tool.
+// ═══════════════════════════════════════════════════════════════════
+
+enum PetitionStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  /// Reached its deadline or was closed by its creator. Still readable,
+  /// still counted — it just takes no new signatures.
+  CLOSED
+}
+
+/// What a petition is ABOUT — "Housing", "Health services", "Transport".
+///
+/// Deliberately NOT the same list as event or live categories. A
+/// petition is aimed at a body that can say yes, so its categories are
+/// the areas that bodies have departments for; "Sober socials" is a
+/// thing you attend, not a thing you can petition a council about.
+///
+/// Admin-managed and closed, like every other taxonomy here: one that
+/// anybody can extend at submit time stops being a taxonomy. Seeded by
+/// prisma/seed-petition-categories.ts.
+/// What a campaign is ORGANISED AROUND — "Housing & homelessness",
+/// "Loneliness & connection".
+///
+/// A separate table from PetitionCategory on purpose, even though the
+/// two lists start out looking alike. A petition is aimed at a body
+/// that can say yes, so its categories are the areas those bodies have
+/// departments for; a campaign is a thing people organise around,
+/// which is not the same cut. Sharing one table would mean retiring a
+/// category in one section silently retired it in the other.
+model CampaignCategory {
+  id          String  @id @default(cuid())
+  name        String  @db.VarChar(80)
+  slug        String  @unique @db.VarChar(80)
+  description String? @db.VarChar(300)
+
+  emoji String? @db.VarChar(8)
+  /// Hex accent for the tile's icon disc, e.g. "#0ea5e9".
+  color String? @db.VarChar(9)
+
+  sortOrder Int     @default(0)
+  /// Hidden rather than deleted, so the campaigns under it keep their
+  /// category while it stops being offered on new ones.
+  isActive  Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  campaigns Campaign[]
+
+  @@index([isActive, sortOrder])
+  @@map("campaign_categories")
+}
+
+model PetitionCategory {
+  id          String  @id @default(cuid())
+  name        String  @db.VarChar(80)
+  slug        String  @unique @db.VarChar(80)
+  description String? @db.VarChar(300)
+
+  emoji String? @db.VarChar(8)
+  /// Hex accent for the tile's icon disc, e.g. "#0ea5e9".
+  color String? @db.VarChar(9)
+
+  sortOrder Int     @default(0)
+  /// Hidden rather than deleted, so the petitions under it keep their
+  /// category while it stops being offered on new ones.
+  isActive  Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  petitions Petition[]
+
+  @@index([isActive, sortOrder])
+  @@map("petition_categories")
+}
+
+model Petition {
+  id      String  @id @default(cuid())
+  slug    String  @unique
+  title   String  @db.VarChar(200)
+  summary String? @db.VarChar(400)
+  /// Markdown, rendered with the same safe renderer as articles.
+  body    String  @db.Text
+
+  coverUrl String?
+
+  /// Extra photos beyond the cover: [{ url, alt? }]. Same shape and
+  /// same meaning as Event.photos — the FIRST photo the creator picks
+  /// becomes coverUrl and the rest land here, so the card has
+  /// something to show and the page has a gallery.
+  photos Json?
+
+  /// One converted video: { assetId, url, posterUrl, width, height,
+  /// durationSec }. Written from a READY VideoAsset owned by the
+  /// creator — never from a URL the client supplies, or a petition
+  /// could be pointed at any file on the server. See
+  /// `resolveAttachedVideo` in @/lib/attached-media.
+  video Json?
+
+  /// Who it is addressed to — "Springfield City Council".
+  /// Required: a petition with no addressee is a complaint, and the
+  /// plan's own example is a specific ask of a specific body.
+  target String @db.VarChar(200)
+
+  /// Signature goal. Null means no goal and no progress bar — a bar
+  /// stuck near zero discourages the next signature, so a creator who
+  /// does not set a target does not get one.
+  goal Int?
+
+  countryId String?
+
+  /// What area this is about. REQUIRED at the edge, NULLABLE in the
+  /// column — the same split events use: making it non-null would
+  /// mean a migration that has to invent a category for every petition
+  /// that already exists, while requiring it in `submitPetition` means
+  /// nothing NEW arrives without one. Retiring a category leaves the
+  /// petitions filed under it alone, which is why this is SetNull.
+  categoryId String?
+  category   PetitionCategory? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+
+  status          PetitionStatus @default(PENDING)
+  rejectionReason String?        @db.Text
+  reviewedAt      DateTime?
+  reviewedBy      String? // AdminUser.id (loose FK)
+
+  /// Stops taking signatures at this point, without anyone acting.
+  closesAt DateTime?
+
+  // Creator: a member for community submissions, an admin when the
+  // team raises one. Snapshots keep the byline if the account goes.
+  creatorUserId         String?
+  creatorNameSnapshot   String  @db.VarChar(120)
+  creatorAvatarSnapshot String?
+  createdByAdminId      String?
+
+  /// Denormalised for list pages. Corrected from the rows on write.
+  signatureCount Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// Reactions are counted separately from signatures and must never
+  /// be confused with them. A signature is the ask; a reaction is
+  /// somebody saying "this matters" without putting their name to it.
+  /// Two numbers, because collapsing them would let a petition claim
+  /// support it does not have.
+  reactionCount Int @default(0)
+
+  signatures PetitionSignature[]
+  reactions  PetitionReaction[]
+
+  // NO back-relation to Campaign, on purpose. Campaign holds its parts
+  // as loose scalar ids and resolves them at read time — its own
+  // comment explains why — and a real relation here would quietly
+  // change that contract for one part and not the others.
+
+  @@index([status, createdAt])
+  @@index([countryId, status, createdAt])
+  /// The category page's query: one category, newest first.
+  @@index([categoryId, status, createdAt])
+  @@index([creatorUserId])
+  @@map("petitions")
+}
+
+/// One person, one signature.
+///
+/// The composite primary key is the integrity rule, not an
+/// optimisation: it makes a second signature from the same account
+/// impossible at the database level rather than dependent on every
+/// call site remembering to check.
+model PetitionSignature {
+  petitionId String
+  userId     String
+
+  // Display snapshots so the signer list renders without joining User.
+  nameSnapshot   String  @db.VarChar(120)
+  avatarSnapshot String?
+
+  /// Optional public reason for signing. Often the most persuasive
+  /// part of a petition — a list of names says how many, a handful of
+  /// reasons says why.
+  comment String? @db.VarChar(400)
+
+  /// Counted, but the name is withheld from the public list. Someone
+  /// signing a petition about family abuse or addiction services may
+  /// need the count without the exposure.
+  isAnonymous Boolean @default(false)
+
+  createdAt DateTime @default(now())
+
+  petition Petition @relation(fields: [petitionId], references: [id], onDelete: Cascade)
+
+  @@id([petitionId, userId])
+  @@index([petitionId, createdAt])
+  @@index([userId, createdAt])
+  @@map("petition_signatures")
+}
+
+/// One reaction per person per petition.
+///
+/// Deliberately NOT folded into PetitionSignature. Signing is a public
+/// act with a name attached and a legal-ish weight; reacting is not.
+/// Sharing a row would mean a reaction implied a signature, or that
+/// un-reacting withdrew one.
+model PetitionReaction {
+  petitionId String
+  userId     String
+  type       Reaction @default(LIKE)
+  createdAt  DateTime @default(now())
+
+  petition Petition @relation(fields: [petitionId], references: [id], onDelete: Cascade)
+
+  @@id([petitionId, userId])
+  @@index([userId, createdAt])
+  @@map("petition_reactions")
+}
+
+// ═══════════════════════════════════════════════════════════════════
+
+enum ChatTier {
+  PUBLIC
+  SUPPORT
+  CRISIS
+  CAVALRY
+}
+
+enum ChatRoomStatus {
+  ACTIVE
+  ARCHIVED
+}
+
+model ChatCategory {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  rooms ChatRoom[]
+
+  @@index([sortOrder])
+  @@map("chat_categories")
+}
+
+model ChatRoom {
+  id          String         @id @default(cuid())
+  slug        String         @unique
+  name        String
+  description String?        @db.Text
+  tier        ChatTier       @default(PUBLIC)
+  status      ChatRoomStatus @default(ACTIVE)
+
+  categoryId String?
+  category   ChatCategory? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+
+  // Optional country scope (null = global). Scalar — no relation.
+  countryId String?
+
+  emoji          String?
+  color          String? // hex accent for the room card
+  allowAnonymous Boolean @default(true)
+  isFeatured     Boolean @default(false)
+  sortOrder      Int     @default(0)
+
+  // Room controls
+  slowModeSeconds Int     @default(0)
+  rulesText       String? @db.Text
+
+  memberCount  Int @default(0)
+  messageCount Int @default(0)
+
+  // Set when this room was created for an event (Delivery 2). Unique
+  // so an event can never end up with two rooms.
+  eventId String? @unique
+  // Same idea for places: one room per place, created on approval.
+  placeId String? @unique
+
+  createdByAdminId String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  memberships ChatMembership[]
+  messages    ChatMessage[]
+
+  @@index([status, tier])
+  @@index([categoryId, sortOrder])
+  @@index([countryId])
+  @@map("chat_rooms")
+}
+
+enum ChatMemberRole {
+  MEMBER
+  MODERATOR
+}
+
+enum ChatMemberStatus {
+  PENDING
+  ACTIVE
+  BANNED
+}
+
+model ChatMembership {
+  id                String           @id @default(cuid())
+  roomId            String
+  userId            String
+  userName          String // snapshot for admin member lists
+  userAvatar        String?
+  role              ChatMemberRole   @default(MEMBER)
+  status            ChatMemberStatus @default(ACTIVE)
+  firstPostApproved Boolean          @default(false)
+  bannedReason      String?          @db.Text
+  lastReadAt        DateTime?
+  lastPostAt        DateTime?
+  joinedAt          DateTime         @default(now())
+
+  room ChatRoom @relation(fields: [roomId], references: [id], onDelete: Cascade)
+
+  @@unique([roomId, userId])
+  @@index([userId])
+  @@index([roomId, status])
+  @@map("chat_memberships")
+}
+
+enum ChatMessageStatus {
+  PUBLISHED
+  PENDING
+  REMOVED
+}
+
+model ChatMessage {
+  id                   String            @id @default(cuid())
+  roomId               String
+  authorId             String?
+  authorNameSnapshot   String
+  authorAvatarSnapshot String?
+  body                 String            @db.Text
+  isAnonymous          Boolean           @default(false)
+  status               ChatMessageStatus @default(PUBLISHED)
+  removedReason        String?           @db.Text
+  isPinned             Boolean           @default(false)
+  editedAt             DateTime?
+  reportCount          Int               @default(0)
+  attachments          Json?
+  replyToId            String?
+  createdAt            DateTime          @default(now())
+
+  room      ChatRoom              @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  replyTo   ChatMessage?          @relation("ChatReply", fields: [replyToId], references: [id], onDelete: SetNull)
+  replies   ChatMessage[]         @relation("ChatReply")
+  reactions ChatMessageReaction[]
+  reports   ChatMessageReport[]
+
+  @@index([roomId, status, createdAt])
+  @@index([roomId, isPinned])
+  @@index([roomId, authorId, createdAt])
+  @@map("chat_messages")
+}
+
+model ChatMessageReaction {
+  id        String   @id @default(cuid())
+  messageId String
+  userId    String
+  emoji     String
+  createdAt DateTime @default(now())
+
+  message ChatMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@unique([messageId, userId, emoji])
+  @@index([messageId])
+  @@map("chat_message_reactions")
+}
+
+model ChatMessageReport {
+  id           String       @id @default(cuid())
+  messageId    String
+  roomId       String
+  reporterId   String?
+  reason       ReportReason
+  notes        String?      @db.Text
+  status       ReportStatus @default(OPEN)
+  resolvedById String?
+  resolvedAt   DateTime?
+  createdAt    DateTime     @default(now())
+
+  /// The message id while this report is OPEN, null afterwards. Same
+  /// null-is-distinct trick as PostReport.openKey — see the note there.
+  openMessageId String?
+
+  message ChatMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@unique([reporterId, openMessageId])
+  @@index([status, createdAt])
+  @@index([roomId, status])
+  @@map("chat_message_reports")
+}
+
+model UserBlock {
+  id        String   @id @default(cuid())
+  blockerId String
+  blockedId String
+  createdAt DateTime @default(now())
+
+  @@unique([blockerId, blockedId])
+  @@index([blockerId])
+  @@map("user_blocks")
+}
+
+// ─── Follows ─────────────────────────────────────────────────────
+// Directional social graph: follower → following. One row per edge.
+// Blocking a user drops any follow edges between the two (see blocks lib).
+model UserFollow {
+  id          String   @id @default(cuid())
+  followerId  String
+  followingId String
+  createdAt   DateTime @default(now())
+
+  @@unique([followerId, followingId])
+  @@index([followerId])
+  @@index([followingId])
+  @@map("user_follows")
+}
+
+enum UserNotifType {
+  CHAT_REPLY
+  CHAT_MENTION
+  CHAT_REACTION
+  CRISIS_ALERT
+  POST_LIKE
+  POST_COMMENT
+  FOLLOW
+  DIRECT_MESSAGE
+  EVENT_APPROVED
+  EVENT_REJECTED
+  EVENT_CANCELLED
+  PLACE_APPROVED
+  PLACE_REJECTED
+  PETITION_APPROVED
+  PETITION_REJECTED
+  CAMPAIGN_APPROVED
+  CAMPAIGN_REJECTED
+  DONATION_RECEIVED
+  PAYOUT_APPROVED
+  PAYOUT_PAID
+  PAYOUT_REJECTED
+  TOWN_HERO_APPROVED
+  TOWN_HERO_REJECTED
+  SYSTEM
+}
+
+model UserNotification {
+  id        String        @id @default(cuid())
+  userId    String
+  type      UserNotifType
+  title     String
+  body      String?       @db.Text
+  actionUrl String?
+  isRead    Boolean       @default(false)
+  createdAt DateTime      @default(now())
+
+  @@index([userId, isRead, createdAt])
+  @@map("user_notifications")
+}
+
+// ─── Gratitude wall ──────────────────────────────────────────────
+// A lightweight, uplifting feed separate from the main community wall:
+// members post what they're grateful for today; others can react with
+// a heart ("grateful too"). Text-only, snapshot author like Posts.
+enum ConfessionStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+// ─── Confession wall ─────────────────────────────────────────────
+// Anonymous-first, sensitive posts. Every confession is held for admin
+// approval before it appears publicly. authorId is ALWAYS stored (for
+// moderation/accountability); public display honours isAnonymous.
+/// Confession categories.
+///
+/// Deliberately SEPARATE from gratitude's. The two need different
+/// words — confessions run to Relapse, Shame, Family; gratitude to
+/// Small wins and Milestones — and a shared list would end up as the
+/// union of both, with half of it wrong on each page.
+model ConfessionCategory {
+  id          String   @id @default(cuid())
+  name        String   @db.VarChar(60)
+  slug        String   @unique
+  description String?  @db.Text
+  /// Shown on the filter chip. One character, or none.
+  emoji       String?  @db.VarChar(8)
+  sortOrder   Int      @default(0)
+  /// Hidden rather than deleted, so the posts under it keep their
+  /// category while it stops being offered on new ones.
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  confessions Confession[]
+
+  @@index([isActive, sortOrder])
+  @@map("confession_categories")
+}
+
+model Confession {
+  id                   String  @id @default(cuid())
+  authorId             String
+  authorNameSnapshot   String
+  authorAvatarSnapshot String?
+  body                 String  @db.Text
+  imageUrl             String?
+  isAnonymous          Boolean @default(true)
+
+  /// One converted video: { assetId, url, posterUrl, width, height,
+  /// durationSec }. Written from a READY VideoAsset owned by the
+  /// author and NEVER from a client-supplied URL — see
+  /// `resolveAttachedVideo` in @/lib/attached-media.
+  ///
+  /// A PHOTO OR A VIDEO, NOT BOTH. The wall card has one square slot,
+  /// and the rule is enforced where the row is written rather than
+  /// here, because `imageUrl` has to stay nullable for the entries
+  /// that have neither.
+  video Json?
+
+  /// What it is about. Optional on purpose: someone writing this at
+  /// 3am should not have to satisfy a dropdown before they can say the
+  /// difficult thing. An admin can set it during review.
+  ///
+  /// SetNull, not Cascade — deleting a category must never delete the
+  /// confessions filed under it.
+  categoryId String?
+  category   ConfessionCategory? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+
+  status          ConfessionStatus @default(PENDING)
+  rejectionReason String?          @db.Text
+  reviewedAt      DateTime?
+  reviewedBy      String? // AdminUser.id (loose FK)
+  supportCount    Int              @default(0)
+  commentCount    Int              @default(0)
+  createdAt       DateTime         @default(now())
+
+  supports ConfessionSupport[]
+  comments ConfessionComment[]
+
+  @@index([status, createdAt])
+  @@index([createdAt, id])
+  @@index([authorId])
+  // The browse query: approved, in this category, newest first.
+  @@index([status, categoryId, createdAt])
+  @@map("confessions")
+}
+
+model ConfessionSupport {
+  id           String   @id @default(cuid())
+  confessionId String
+  userId       String
+  /// Which reaction. The table keeps its name — it is still one row
+  /// per person per confession, and `supportCount` still counts
+  /// people, not reactions.
+  type         Reaction @default(LIKE)
+  createdAt    DateTime @default(now())
+
+  confession Confession @relation(fields: [confessionId], references: [id], onDelete: Cascade)
+
+  @@unique([confessionId, userId])
+  @@index([userId])
+  @@map("confession_supports")
+}
+
+// Comments post instantly (banned-word masked), only confessions are
+// moderated. Commenter may also be anonymous.
+model ConfessionComment {
+  id                   String   @id @default(cuid())
+  confessionId         String
+  authorId             String
+  authorNameSnapshot   String
+  authorAvatarSnapshot String?
+  body                 String   @db.Text
+  isAnonymous          Boolean  @default(false)
+  likeCount            Int      @default(0)
+
+  /// Threading, one level deep — a reply to a reply is re-parented to
+  /// the top-level comment. Confession comments were flat until the
+  /// wall got its own entry pages; the reply lives on a real page now,
+  /// so it may as well work the way every other thread here does.
+  parentId String?
+  parent   ConfessionComment?  @relation("ConfessionCommentReplies", fields: [parentId], references: [id], onDelete: Cascade)
+  replies  ConfessionComment[] @relation("ConfessionCommentReplies")
+
+  createdAt            DateTime @default(now())
+
+  reactions  ConfessionCommentReaction[]
+  confession Confession @relation(fields: [confessionId], references: [id], onDelete: Cascade)
+
+  @@index([confessionId, createdAt])
+  @@index([parentId, createdAt])
+  @@index([authorId])
+  @@map("confession_comments")
+}
+
+enum GratitudeStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+/// Gratitude categories. See ConfessionCategory for why they are two
+/// tables rather than one.
+model GratitudeCategory {
+  id          String   @id @default(cuid())
+  name        String   @db.VarChar(60)
+  slug        String   @unique
+  description String?  @db.Text
+  emoji       String?  @db.VarChar(8)
+  sortOrder   Int      @default(0)
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  entries GratitudeEntry[]
+
+  @@index([isActive, sortOrder])
+  @@map("gratitude_categories")
+}
+
+model GratitudeEntry {
+  id                   String  @id @default(cuid())
+  authorId             String
+  authorNameSnapshot   String
+  authorAvatarSnapshot String?
+  body                 String  @db.Text
+  imageUrl             String?
+  isAnonymous          Boolean @default(false)
+
+  /// One converted video: { assetId, url, posterUrl, width, height,
+  /// durationSec }. Written from a READY VideoAsset owned by the
+  /// author and NEVER from a client-supplied URL — see
+  /// `resolveAttachedVideo` in @/lib/attached-media.
+  ///
+  /// A PHOTO OR A VIDEO, NOT BOTH. The wall card has one square slot,
+  /// and the rule is enforced where the row is written rather than
+  /// here, because `imageUrl` has to stay nullable for the entries
+  /// that have neither.
+  video Json?
+
+  /// Optional, same reasoning as confessions.
+  categoryId String?
+  category   GratitudeCategory? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+
+  heartCount      Int             @default(0)
+  /// Recounted from the rows on every write, never incremented — the
+  /// same rule the rest of this codebase follows.
+  commentCount    Int             @default(0)
+  // Moderation: new entries wait for admin approval before appearing
+  // on the public wall. Authors still see their own PENDING/REJECTED.
+  status          GratitudeStatus @default(PENDING)
+  rejectionReason String?         @db.Text
+  reviewedAt      DateTime?
+  reviewedBy      String? // AdminUser.id (loose FK)
+  createdAt       DateTime        @default(now())
+
+  hearts   GratitudeHeart[]
+  comments GratitudeComment[]
+
+  @@index([status, createdAt])
+  @@index([createdAt, id])
+  @@index([authorId])
+  @@index([status, categoryId, createdAt])
+  @@map("gratitude_entries")
+}
+
+/// A reply on the gratitude wall.
+///
+/// Shaped like ClipComment on purpose — the two are read by the same
+/// component, and where they differ it is a bug in one of them.
+///
+/// THREADS ARE ONE LEVEL DEEP. `parentId` points only at a top-level
+/// comment; a reply to a reply is re-parented by the server. Deep
+/// threads indent until the text is a column one word wide, and they
+/// encourage argument over support, which is the opposite of what a
+/// gratitude wall is for.
+///
+/// REACTIONS ON REPLIES, via GratitudeCommentReaction, the same as
+/// every other comment surface. An earlier version deliberately had
+/// none — the argument was that a reaction on the entry plus a
+/// different one on its replies is two vocabularies on one card. It
+/// lost to the simpler position that a reply deserves the same
+/// response as anything else somebody writes here.
+model GratitudeComment {
+  id                   String   @id @default(cuid())
+  entryId              String
+  authorId             String
+  authorNameSnapshot   String
+  authorAvatarSnapshot String?
+  body                 String   @db.Text
+  isAnonymous          Boolean  @default(false)
+
+  parentId String?
+  parent   GratitudeComment?  @relation("GratitudeCommentReplies", fields: [parentId], references: [id], onDelete: Cascade)
+  replies  GratitudeComment[] @relation("GratitudeCommentReplies")
+
+  likeCount Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  reactions GratitudeCommentReaction[]
+  entry     GratitudeEntry @relation(fields: [entryId], references: [id], onDelete: Cascade)
+
+  /// The thread query: one entry, oldest first.
+  @@index([entryId, createdAt])
+  @@index([parentId, createdAt])
+  @@index([authorId])
+  @@map("gratitude_comments")
+}
+
+model GratitudeHeart {
+  id        String   @id @default(cuid())
+  entryId   String
+  userId    String
+  type      Reaction @default(LIKE)
+  createdAt DateTime @default(now())
+
+  entry GratitudeEntry @relation(fields: [entryId], references: [id], onDelete: Cascade)
+
+  @@unique([entryId, userId])
+  @@index([userId])
+  @@map("gratitude_hearts")
+}
+
+// ─── Direct messages ─────────────────────────────────────────────
+// 1:1 threads. The pair is stored sorted (userAId < userBId) with a
+// unique constraint so a pair can never spawn duplicate conversations.
+model Conversation {
+  id              String   @id @default(cuid())
+  userAId         String
+  userBId         String
+  lastMessageAt   DateTime @default(now())
+  lastMessageText String?  @db.Text
+  lastSenderId    String?
+  createdAt       DateTime @default(now())
+
+  participants ConversationParticipant[]
+  messages     DirectMessage[]
+
+  @@unique([userAId, userBId])
+  @@index([userAId])
+  @@index([userBId])
+  @@map("conversations")
+}
+
+model ConversationParticipant {
+  id             String    @id @default(cuid())
+  conversationId String
+  userId         String
+  // false = this thread is a pending request for this user (sender is
+  // someone they don't follow). Replying/accepting flips it true.
+  isAccepted     Boolean   @default(true)
+  lastReadAt     DateTime?
+  typingAt       DateTime?
+  archivedAt     DateTime?
+  mutedAt        DateTime?
+  createdAt      DateTime  @default(now())
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@unique([conversationId, userId])
+  @@index([userId, isAccepted])
+  @@map("conversation_participants")
+}
+
+model DirectMessage {
+  id             String    @id @default(cuid())
+  conversationId String
+  senderId       String
+  body           String    @db.Text
+  imageUrl       String?
+  deletedAt      DateTime?
+  createdAt      DateTime  @default(now())
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId, createdAt])
+  @@map("direct_messages")
+}
+
+model BannedWord {
+  id        String   @id @default(cuid())
+  word      String   @unique // stored lowercase
+  createdAt DateTime @default(now())
+
+  @@map("banned_words")
+}
+
+// ─── Articles (magazine) ─────────────────────────────────────────
+// Admin-authored long-form content — the "magazine-style article
+// reader" from the project plan. Bodies hold the same Markdown
+// subset used elsewhere and are rendered through the XSS-safe React
+// renderer in src/lib/rich-text.tsx (never raw HTML), so an author
+// can't inject script through an article.
+//
+// Follows the newer loose-FK convention used by gratitude and
+// confessions: reader rows carry a plain `userId` plus display
+// snapshots rather than a Prisma relation back to User, which keeps
+// the User model untouched.
+
+enum ArticleStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+/// A page's picture and its words.
+///
+/// One row per page, keyed by a short stable string that lives in
+/// `BANNER_PAGES` in src/lib/page-banners.ts — NOT by route, because a
+/// route can be renamed and a banner shouldn't be orphaned when it is.
+///
+/// Every field is nullable and the whole row is optional. A page with
+/// no row, or a row with nothing filled in, renders exactly the header
+/// it always did: the defaults live in code beside the key, so this
+/// table only ever holds the CHANGES an admin has made. That is what
+/// makes shipping it a no-op until someone uploads a photo.
+model PageBanner {
+  id      String @id @default(cuid())
+  pageKey String @unique @db.VarChar(60)
+
+  imageUrl String? @db.VarChar(500)
+  /// Describes the photo for a screen reader. Empty is allowed and
+  /// correct when the image is pure decoration.
+  imageAlt String? @db.VarChar(200)
+
+  /// Override the page's title. Null keeps the built-in one.
+  headline String? @db.VarChar(120)
+  /// Override the sentence under it. Null keeps the built-in one.
+  ///
+  /// `{country}` is substituted with the viewer's country, so the
+  /// pages whose copy already varied ("Ask for something to change in
+  /// Ireland") keep doing that after an admin rewrites them.
+  intro    String? @db.Text
+
+  /// Off hides the IMAGE, not the page. The words still render.
+  enabled Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("page_banners")
+}
+
+model ArticleCategory {
+  id          String  @id @default(cuid())
+  name        String
+  slug        String  @unique
+  description String? @db.Text
+
+  /// Shown on the category tile. Same pair as LiveCategory and
+  /// EventCategory — a grid of tiles with no emoji and no accent is a
+  /// list of links wearing a box.
+  emoji String? @db.VarChar(8)
+  /// Hex accent, e.g. "#0ea5e9".
+  color String? @db.VarChar(9)
+
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  articles Article[]
+
+  @@index([sortOrder])
+  @@map("article_categories")
+}
+
+model Article {
+  id      String  @id @default(cuid())
+  slug    String  @unique
+  title   String  @db.VarChar(200)
+  excerpt String? @db.VarChar(400)
+  body    String  @db.Text
+
+  // Cover art for the index card + reader header. Inline images live
+  // inside `body` as Markdown image syntax.
+  coverUrl String?
+  coverAlt String?
+
+  /// Extra photos beyond the cover: [{ url, alt? }]. Same shape and
+  /// same meaning as Campaign.photos, Place.photos, Event.photos and
+  /// Petition.photos — one component renders all five.
+  ///
+  /// NOT THE SAME THING AS THE INLINE IMAGES IN `body`. Those are part
+  /// of the writing and sit where the author put them; this is a set
+  /// at the end, for the photographs that go with a piece rather than
+  /// inside it. Both are swept from different places, which is why the
+  /// warning below matters.
+  ///
+  /// EVERY URL IN HERE MUST BE REACHABLE FROM `collectReferencedUrls`
+  /// in src/lib/media.ts, or the media sweeper will decide these files
+  /// are orphans and offer to delete them.
+  photos Json?
+  // Optional YouTube / Vimeo URL rendered as an embed in the reader.
+  videoUrl String?
+
+  categoryId String?
+  category   ArticleCategory? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+
+  status      ArticleStatus @default(DRAFT)
+  isFeatured  Boolean       @default(false)
+  featuredAt  DateTime?
+  publishedAt DateTime?
+  // Estimated reading time in minutes, computed from body length on save.
+  readMinutes Int           @default(1)
+
+  // Author is an admin (loose FK) plus snapshots so the byline
+  // survives the admin row being removed.
+  authorAdminId        String?
+  authorNameSnapshot   String
+  authorAvatarSnapshot String?
+
+  // Denormalised counters — cheap for index cards, refreshed on write.
+  viewCount    Int @default(0)
+  likeCount    Int @default(0)
+  saveCount    Int @default(0)
+  commentCount Int @default(0)
+
+  comments  ArticleComment[]
+  likes     ArticleLike[]
+  saves     ArticleSave[]
+  campaigns CampaignArticle[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, publishedAt])
+  @@index([categoryId, status, publishedAt])
+  @@index([isFeatured, featuredAt])
+  @@map("articles")
+}
+
+enum ArticleCommentStatus {
+  PUBLISHED
+  REMOVED
+}
+
+model ArticleComment {
+  id                   String               @id @default(cuid())
+  articleId            String
+  authorId             String
+  authorNameSnapshot   String
+  authorAvatarSnapshot String?
+  body                 String               @db.Text
+  isAnonymous          Boolean              @default(false)
+  status               ArticleCommentStatus @default(PUBLISHED)
+  removedReason        String?              @db.Text
+
+  // Threading. Deliberately capped at ONE level of replies: a reply to
+  // a reply is re-parented to the top-level comment (see
+  // addArticleComment). Deep threads are hard to follow on a phone and
+  // encourage argument over support, which is the opposite of what this
+  // platform is for.
+  parentId String?
+  parent   ArticleComment?  @relation("ArticleCommentReplies", fields: [parentId], references: [id], onDelete: Cascade)
+  replies  ArticleComment[] @relation("ArticleCommentReplies")
+
+  likeCount Int                  @default(0)
+  likes     ArticleCommentLike[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  article Article @relation(fields: [articleId], references: [id], onDelete: Cascade)
+
+  @@index([articleId, status, createdAt])
+  @@index([parentId, createdAt])
+  @@index([authorId])
+  @@map("article_comments")
+}
+
+model ArticleCommentLike {
+  commentId String
+  userId    String
+  type      Reaction @default(LIKE)
+  createdAt DateTime @default(now())
+
+  comment ArticleComment @relation(fields: [commentId], references: [id], onDelete: Cascade)
+
+  @@id([commentId, userId])
+  @@index([userId, createdAt])
+  @@map("article_comment_likes")
+}
+
+model ArticleLike {
+  articleId String
+  userId    String
+  type      Reaction @default(LIKE)
+  createdAt DateTime @default(now())
+
+  article Article @relation(fields: [articleId], references: [id], onDelete: Cascade)
+
+  @@id([articleId, userId])
+  @@index([userId, createdAt])
+  @@map("article_likes")
+}
+
+model ArticleSave {
+  articleId String
+  userId    String
+  createdAt DateTime @default(now())
+
+  article Article @relation(fields: [articleId], references: [id], onDelete: Cascade)
+
+  @@id([articleId, userId])
+  @@index([userId, createdAt])
+  @@map("article_saves")
+}
+
+// ─── Events (Delivery 2) ─────────────────────────────────────────
+// Real-world gatherings: sober socials, hikes, coffee meetups, group
+// volunteering. Anyone can submit one; it waits for admin approval
+// before it appears, the same posture as gratitude and confessions.
+//
+// Times are stored as UTC instants PLUS the IANA zone the organiser
+// chose. Rendering "7pm" for an event that is actually 7pm in another
+// city is the kind of mistake that leaves someone standing outside a
+// closed door, so the zone travels with the event rather than being
+// inferred from the reader.
+
+enum EventStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+model Event {
+  id          String  @id @default(cuid())
+  slug        String  @unique
+  title       String  @db.VarChar(200)
+  summary     String? @db.VarChar(400)
+  // Markdown, rendered with the same safe renderer as articles.
+  description String  @db.Text
+  coverUrl    String?
+  // Extra photos beyond the cover: [{ url, alt? }]. A flyer, shots from
+  // last time, the meeting point — the things that make someone
+  // confident enough to actually turn up.
+  photos      Json?
+
+  // When. `startsAt`/`endsAt` are UTC instants; `timezone` is the IANA
+  // zone (e.g. "America/New_York") the organiser entered them in.
+  startsAt DateTime
+  endsAt   DateTime?
+  timezone String    @default("UTC")
+
+  // Where. Online events carry a joinUrl instead of a venue.
+  isOnline    Boolean @default(false)
+  joinUrl     String?
+  venueName   String?
+  addressLine String?
+  city        String?
+  // Scalar country scope, matching ChatRoom — the country picker
+  // filters the calendar.
+  countryId   String?
+
+  /// What kind of thing this is. Nullable in the SCHEMA so the
+  /// migration lands on existing rows, and required by the API — the
+  /// same split used for LiveStream.categoryId.
+  categoryId String?
+  category   EventCategory? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+
+  // Optional cap. Null = unlimited.
+  capacity Int?
+
+  status          EventStatus @default(PENDING)
+  rejectionReason String?     @db.Text
+  reviewedAt      DateTime?
+  reviewedBy      String? // AdminUser.id (loose FK)
+
+  // Organiser: a member for community submissions, or an admin when
+  // the team creates it directly. Snapshots keep the byline if the
+  // account goes away.
+  hostUserId         String?
+  hostNameSnapshot   String
+  hostAvatarSnapshot String?
+  createdByAdminId   String?
+
+  // Every approved event gets a chatroom so attendees can coordinate
+  // beforehand and keep talking afterwards.
+  chatRoomId String?
+
+  rsvpCount Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  rsvps     EventRsvp[]
+  campaigns CampaignEvent[]
+
+  @@index([status, startsAt])
+  @@index([countryId, status, startsAt])
+  @@index([hostUserId])
+  /// Backs the category chips on the calendar.
+  @@index([categoryId, status, startsAt])
+  @@map("events")
+}
+
+model EventRsvp {
+  eventId        String
+  userId         String
+  // Display snapshots so the attendee list renders without joining User.
+  nameSnapshot   String
+  avatarSnapshot String?
+  createdAt      DateTime @default(now())
+
+  event Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  @@id([eventId, userId])
+  @@index([userId, createdAt])
+  @@map("event_rsvps")
+}
+
+// ─── Video ────────────────────────────────────────────────────────
+// Uploaded video is never served as it arrived. Phones produce HEVC in
+// .mov, desktops produce .mkv and .webm, and none of that plays on
+// every device — iOS Safari in particular. So an upload becomes a row
+// here first, gets converted to H.264/AAC MP4 with a poster frame, and
+// only then does a URL exist to put in a post, a clip or an article.
+//
+// The row is also the progress channel: the browser polls it while
+// ffmpeg works, which is why `percent` and `etaSeconds` live here
+// rather than in memory. A server restart mid-convert leaves a row in
+// PROCESSING with a stale `heartbeatAt`, which the status endpoint
+// reports as failed rather than spinning forever.
+
+enum VideoStatus {
+  UPLOADING
+  QUEUED
+  PROCESSING
+  READY
+  FAILED
+}
+
+model VideoAsset {
+  id     String      @id @default(cuid())
+  status VideoStatus @default(UPLOADING)
+
+  // Who uploaded it. Loose FK on purpose, matching the rest of the
+  // schema: a deleted account must not cascade away a post's video.
+  ownerId   String?
+  ownerKind String  @default("USER") // USER | ADMIN
+  category  String  @default("clips")
+
+  originalName String  @db.VarChar(300)
+  originalMime String? @db.VarChar(120)
+  originalSize Int?    @db.UnsignedInt
+
+  // Populated once conversion succeeds.
+  url         String? @db.VarChar(500)
+  posterUrl   String? @db.VarChar(500)
+  width       Int?
+  height      Int?
+  durationSec Float?
+  outputSize  Int?    @db.UnsignedInt
+
+  // Progress, written by the converter and read by the poller.
+  percent     Int       @default(0)
+  etaSeconds  Int?
+  stage       String    @default("") @db.VarChar(60)
+  heartbeatAt DateTime?
+
+  error String? @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([ownerId, createdAt])
+  @@index([status, createdAt])
+  @@map("video_assets")
+}
+
+// ─── Library (Delivery 2) ────────────────────────────────────────
+// Themed collections of short clips — exercise, spirituality, recovery.
+// Someone who wants one kind of content shouldn't be handed all of it.
+//
+// Curation is admin-only by design: a theme page is a stance about
+// what belongs there, and an open submission queue turns it into
+// another moderation job. Members follow a theme and like or save
+// individual clips.
+//
+// A clip is EITHER an embed (YouTube, Vimeo, Spotify — nothing hosted,
+// nothing transcoded) OR an upload that went through the video
+// pipeline. Both render in the same card; only the player differs.
+
+enum ClipCommentStatus {
+  PUBLISHED
+  REMOVED
+}
+
+enum ClipKind {
+  EMBED
+  UPLOAD
+}
+
+/// One theme in the Library — Movement, Stillness, Nature.
+///
+/// Renamed from `Fanbase`, which implied a performer with followers.
+/// Nobody here is a fan of anything; they are looking for five calm
+/// minutes about stillness.
+///
+/// Called a THEME, not a collection, because that is the word the UI
+/// has always used and the one that fits what these are. The model
+/// name follows the product rather than the other way round — the
+/// point of renaming at all was to stop the code and the interface
+/// describing the same thing differently.
+model LibraryTheme {
+  id       String  @id @default(cuid())
+  slug     String  @unique
+  name     String  @db.VarChar(120)
+  tagline  String? @db.VarChar(240)
+  // Longer copy for the theme page header. Markdown.
+  about    String? @db.Text
+  coverUrl String?
+  // Emoji shown where there is no cover — cheap, and it survives a
+  // missing image better than a grey box.
+  emoji    String? @db.VarChar(8)
+
+  isActive  Boolean @default(true)
+  sortOrder Int     @default(0)
+
+  // Denormalised counters, same convention as Article.
+  followerCount Int @default(0)
+  clipCount     Int @default(0)
+
+  clips   Clip[]
+  follows ThemeFollow[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([isActive, sortOrder])
+  @@map("library_themes")
+}
+
+model ThemeFollow {
+  themeId   String
+  userId    String
+  createdAt DateTime @default(now())
+
+  theme LibraryTheme @relation(fields: [themeId], references: [id], onDelete: Cascade)
+
+  @@id([themeId, userId])
+  @@index([userId, createdAt])
+  @@map("theme_follows")
+}
+
+model Clip {
+  id      String       @id @default(cuid())
+  themeId String
+  theme   LibraryTheme @relation(fields: [themeId], references: [id], onDelete: Cascade)
+
+  title   String  @db.VarChar(200)
+  caption String? @db.Text
+
+  kind ClipKind @default(EMBED)
+
+  // EMBED — the original URL as pasted. Resolved to a safe iframe src
+  // at render time by src/lib/embeds.ts; never stored pre-resolved, so
+  // a fix to the whitelist applies retroactively.
+  embedUrl String? @db.VarChar(500)
+
+  // UPLOAD — populated from a converted VideoAsset. The URL is copied
+  // rather than joined so a clip keeps working if the asset row is
+  // ever pruned.
+  videoAssetId String?
+  videoUrl     String? @db.VarChar(500)
+  posterUrl    String? @db.VarChar(500)
+  width        Int?
+  height       Int?
+  durationSec  Float?
+
+  isPublished Boolean   @default(true)
+  publishedAt DateTime?
+  sortOrder   Int       @default(0)
+
+  likeCount    Int @default(0)
+  saveCount    Int @default(0)
+  viewCount    Int @default(0)
+  /// Recounted on every write rather than incremented — a counter that
+  /// drifts is worse than one that costs a COUNT.
+  commentCount Int @default(0)
+
+  addedByAdminId String?
+
+  likes    ClipLike[]
+  saves    ClipSave[]
+  comments ClipComment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([themeId, isPublished, sortOrder])
+  @@index([isPublished, publishedAt])
+  @@map("clips")
+}
+
+/// A comment on a library clip.
+///
+/// Modelled on ArticleComment down to the field names, because it is
+/// the same thing: a threaded, likeable, removable comment with author
+/// snapshots. Two nearly-identical models are worth less than one
+/// pattern applied twice — the next person only has to learn it once.
+///
+/// THREADS ARE ONE LEVEL DEEP. `parentId` points only at a top-level
+/// comment; the writer re-parents a reply-to-a-reply up to the root.
+/// The alternative is a UI that indents until the text is a column one
+/// word wide, and a query that cannot be written without recursion.
+model ClipComment {
+  id                   String            @id @default(cuid())
+  clipId               String
+  authorId             String
+  authorNameSnapshot   String
+  authorAvatarSnapshot String?
+  body                 String            @db.Text
+  isAnonymous          Boolean           @default(false)
+  status               ClipCommentStatus @default(PUBLISHED)
+  removedReason        String?           @db.Text
+
+  parentId String?
+  parent   ClipComment?  @relation("ClipCommentReplies", fields: [parentId], references: [id], onDelete: Cascade)
+  replies  ClipComment[] @relation("ClipCommentReplies")
+
+  likeCount Int               @default(0)
+  likes     ClipCommentLike[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  clip Clip @relation(fields: [clipId], references: [id], onDelete: Cascade)
+
+  // The thread query: one clip, published, oldest first.
+  @@index([clipId, status, createdAt])
+  @@index([parentId, createdAt])
+  @@index([authorId])
+  @@map("clip_comments")
+}
+
+model ClipCommentLike {
+  commentId String
+  userId    String
+  type      Reaction @default(LIKE)
+  createdAt DateTime @default(now())
+
+  comment ClipComment @relation(fields: [commentId], references: [id], onDelete: Cascade)
+
+  @@id([commentId, userId])
+  @@index([userId, createdAt])
+  @@map("clip_comment_likes")
+}
+
+/// One reaction per person per comment. Same shape as
+/// ArticleCommentLike, which predates the reaction set and keeps its
+/// older name; where the two differ it is a bug in one of them.
+model PostCommentReaction {
+  commentId String
+  userId    String
+  type      Reaction @default(LIKE)
+  createdAt DateTime @default(now())
+
+  comment PostComment @relation(fields: [commentId], references: [id], onDelete: Cascade)
+
+  @@id([commentId, userId])
+  @@index([userId, createdAt])
+  @@map("post_comment_reactions")
+}
+
+/// One reaction per person per comment. Same shape as
+/// ArticleCommentLike, which predates the reaction set and keeps its
+/// older name; where the two differ it is a bug in one of them.
+model ConfessionCommentReaction {
+  commentId String
+  userId    String
+  type      Reaction @default(LIKE)
+  createdAt DateTime @default(now())
+
+  comment ConfessionComment @relation(fields: [commentId], references: [id], onDelete: Cascade)
+
+  @@id([commentId, userId])
+  @@index([userId, createdAt])
+  @@map("confession_comment_reactions")
+}
+
+/// One reaction per person per comment. Same shape as
+/// ArticleCommentLike, which predates the reaction set and keeps its
+/// older name; where the two differ it is a bug in one of them.
+model GratitudeCommentReaction {
+  commentId String
+  userId    String
+  type      Reaction @default(LIKE)
+  createdAt DateTime @default(now())
+
+  comment GratitudeComment @relation(fields: [commentId], references: [id], onDelete: Cascade)
+
+  @@id([commentId, userId])
+  @@index([userId, createdAt])
+  @@map("gratitude_comment_reactions")
+}
+
+model ClipLike {
+  clipId    String
+  userId    String
+  type      Reaction @default(LIKE)
+  createdAt DateTime @default(now())
+
+  clip Clip @relation(fields: [clipId], references: [id], onDelete: Cascade)
+
+  @@id([clipId, userId])
+  @@index([userId, createdAt])
+  @@map("clip_likes")
+}
+
+model ClipSave {
+  clipId    String
+  userId    String
+  createdAt DateTime @default(now())
+
+  clip Clip @relation(fields: [clipId], references: [id], onDelete: Cascade)
+
+  @@id([clipId, userId])
+  @@index([userId, createdAt])
+  @@map("clip_saves")
+}
+
+// ─── Uploaded files ──────────────────────────────────────────────
+// An ownership record for every file written to public/uploads.
+//
+// WHY THIS EXISTS: the URLs attached to a post, an article or an event
+// are strings the CLIENT sent. Deleting a file because a row mentions
+// its URL would mean anyone could put "/uploads/logos/site-logo.png"
+// in their own post, delete the post, and take the site's logo with
+// it. So deletion never works from a URL alone — it works from a row
+// here, which records who actually uploaded the file. No row, no
+// delete.
+//
+// It also makes storage answerable: what exists, who put it there,
+// how big it is, and what is no longer referenced by anything.
+
+model UploadedFile {
+  id String @id @default(cuid())
+
+  // The public URL exactly as it is stored on referencing rows, e.g.
+  // "/uploads/posts/abc.jpg". Unique so one file has exactly one owner.
+  url     String @unique @db.VarChar(500)
+  // Path relative to public/, which is what actually gets unlinked.
+  // Kept separately from `url` because a CDN prefix can make the two
+  // differ, and unlinking must never be derived from a public URL.
+  relPath String @db.VarChar(500)
+
+  category String  @db.VarChar(40)
+  bytes    Int     @db.UnsignedInt
+  mime     String? @db.VarChar(120)
+
+  // Loose FK, like the rest of the schema. USER | ADMIN | SYSTEM.
+  ownerId   String?
+  ownerKind String  @default("USER") @db.VarChar(10)
+
+  createdAt DateTime @default(now())
+
+  @@index([ownerId, createdAt])
+  @@index([category, createdAt])
+  @@map("uploaded_files")
+}
+
+// ─── Awareness campaigns (Delivery 2) ────────────────────────────
+// One cause, one page, everything about it in one place.
+//
+// This is an AGGREGATOR and nothing else. A campaign owns a title, a
+// cover and some copy; every other thing on its page is a row that
+// already exists somewhere else — an article, a chatroom, an event.
+// The moment a campaign grows its own content type, it has become a
+// second CMS and the plan's warning has been ignored.
+//
+// `petitionId` was added here before petitions existed, so that
+// shipping them would be a form field rather than a migration on a
+// table with live rows. Petitions exist now; the column was waiting.
+
+enum CampaignStatus {
+  /// Waiting for review. ONLY member submissions land here; a campaign
+  /// the team starts goes to DRAFT, which is a different thing: DRAFT
+  /// is unfinished, PENDING is finished and waiting on us. Collapsing
+  /// the two would bury submissions in the same list as half-written
+  /// admin drafts.
+  PENDING
+  DRAFT
+  PUBLISHED
+  /// Turned down at review, with the reason in `reviewNote`. Kept
+  /// rather than deleted so the submitter can be told why and the same
+  /// thing is not re-submitted into a queue that has already seen it.
+  REJECTED
+  ARCHIVED
+}
+
+model Campaign {
+  id      String  @id @default(cuid())
+  slug    String  @unique
+  title   String  @db.VarChar(200)
+  // One line for the index card.
+  summary String? @db.VarChar(400)
+  // The case for the cause. Markdown, rendered by the shared renderer.
+  body    String? @db.Text
+
+  coverUrl     String?
+
+  /// Extra photos beyond the cover: [{ url, alt? }]. Same shape and
+  /// same meaning as Event.photos and Petition.photos — the FIRST
+  /// photo the creator picks becomes coverUrl and the rest land here,
+  /// so the card has something to show and the page has a gallery.
+  ///
+  /// EVERY URL IN HERE MUST BE REACHABLE FROM `collectReferencedUrls`
+  /// in src/lib/media.ts, or the media sweeper will decide these files
+  /// are orphans and offer to delete them.
+  photos Json?
+
+  emoji        String? @db.VarChar(8)
+  // What someone is being asked to do — "Sign the pledge", "Come to
+  // the march". Optional; without it the page just shows Support.
+  callToAction String? @db.VarChar(120)
+  ctaUrl       String? @db.VarChar(500)
+
+  status      CampaignStatus @default(DRAFT)
+  publishedAt DateTime?
+  // Optional window, so a campaign can read as finished without being
+  // deleted.
+  startsAt    DateTime?
+  endsAt      DateTime?
+
+  // Country scoping, the same way posts and events do it.
+  countryId String?
+
+  /// What this is organised around. REQUIRED at the edge, NULLABLE in
+  /// the column — the same split petitions and events use. Making it
+  /// non-null would mean a migration that invents a category for every
+  /// campaign that already exists; requiring it in `submitCampaign`
+  /// and `createCampaign` means nothing NEW arrives without one, and
+  /// the admin list has an Uncategorised filter for the backlog.
+  /// Retiring a category leaves the campaigns filed under it alone,
+  /// which is why this is SetNull.
+  categoryId String?
+  category   CampaignCategory? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+
+  // ── review, for the ones members send in ──
+  // Loose FK plus a snapshot, exactly as places and petitions do it:
+  // the byline has to survive the account being deleted.
+  submittedByUserId       String?
+  submitterNameSnapshot   String?   @db.VarChar(120)
+  submitterAvatarSnapshot String?
+  /// Why it was turned down, or a note from whoever approved it.
+  reviewNote              String?   @db.Text
+  reviewedAt              DateTime?
+  reviewedByAdminId       String?
+
+  // ── the parts it pulls together ──
+  // Loose FKs on purpose: deleting the chatroom or the petition must
+  // not cascade the whole campaign away. The reader lib resolves them
+  // and simply omits anything that has since gone.
+  chatRoomId String?
+  /// Resolved by the campaign reader against the petitions table. Kept
+  /// a loose id like chatRoomId above, for the reason stated there.
+  petitionId String?
+
+  supporterCount Int @default(0)
+
+  articles CampaignArticle[]
+  events   CampaignEvent[]
+  supports CampaignSupport[]
+
+  createdByAdminId String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@index([status, publishedAt])
+  @@index([countryId, status])
+  /// The category page's query: one category, newest published first.
+  @@index([categoryId, status, publishedAt])
+  /// "What have I sent in?", and the admin queue's submitter column.
+  @@index([submittedByUserId])
+  @@map("campaigns")
+}
+
+model CampaignArticle {
+  campaignId String
+  articleId  String
+  sortOrder  Int    @default(0)
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  article  Article  @relation(fields: [articleId], references: [id], onDelete: Cascade)
+
+  @@id([campaignId, articleId])
+  @@index([articleId])
+  @@map("campaign_articles")
+}
+
+model CampaignEvent {
+  campaignId String
+  eventId    String
+  sortOrder  Int    @default(0)
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  event    Event    @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  @@id([campaignId, eventId])
+  @@index([eventId])
+  @@map("campaign_events")
+}
+
+model CampaignSupport {
+  campaignId String
+  userId     String
+  createdAt  DateTime @default(now())
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  @@id([campaignId, userId])
+  @@index([userId, createdAt])
+  @@map("campaign_supports")
+}
+
+// ─── Map & directory (Delivery 2) ────────────────────────────────
+// Real places a person can walk into: recovery programs, clinics,
+// churches, food banks, animal shelters. One dataset, two views — a
+// map to browse and a list to scan.
+//
+// COORDINATES ARE STORED, NEVER DERIVED AT RENDER TIME. Geocoding
+// happens once, when a place is saved, and the result lives on the
+// row. Nominatim allows roughly one request a second; geocoding on
+// page load would get the whole app blocked, and the map would be at
+// the mercy of a third party's uptime. `geocodedAt` records when it
+// last succeeded so a stale or failed lookup is visible rather than
+// silently leaving a pin at (0,0).
+
+enum PlaceType {
+  RECOVERY_PROGRAM
+  CLINIC
+  COUNSELLING
+  CHURCH
+  FOOD_BANK
+  ANIMAL_SHELTER
+  SHELTER
+  COMMUNITY_CENTRE
+  DONATING_BUSINESS
+  OTHER
+}
+
+enum PlaceStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CLOSED
+}
+
+model Place {
+  id      String    @id @default(cuid())
+  slug    String    @unique
+  name    String    @db.VarChar(200)
+  type    PlaceType @default(OTHER)
+  summary String?   @db.VarChar(400)
+  /// Longer description. Markdown.
+  about   String?   @db.Text
+
+  // ── where ──
+  addressLine  String?   @db.VarChar(300)
+  city         String?   @db.VarChar(120)
+  postcode     String?   @db.VarChar(30)
+  countryId    String?
+  stateId      String?
+  // Set by the geocoder, or typed by an admin who knows better.
+  latitude     Float?
+  longitude    Float?
+  geocodedAt   DateTime?
+  /// Why the last geocode failed, so a missing pin is explainable.
+  geocodeError String?   @db.VarChar(300)
+
+  // ── how to reach them ──
+  phone   String? @db.VarChar(40)
+  email   String? @db.VarChar(200)
+  website String? @db.VarChar(500)
+  /// [{ day: 0-6, opens: "09:00", closes: "17:00", closed?: true }]
+  hours   Json?
+  /// Free text — "Drivers on Saturdays", "Tinned fish, nappies".
+  needs   String? @db.Text
+
+  coverUrl String?
+
+  /// Extra photos beyond the cover: [{ url, alt? }]. Same shape and
+  /// same meaning as Event.photos and Petition.photos — the FIRST
+  /// photo the creator picks becomes coverUrl and the rest land here,
+  /// so the card has something to show and the page has a gallery.
+  ///
+  /// EVERY URL IN HERE MUST BE REACHABLE FROM `collectReferencedUrls`
+  /// in src/lib/media.ts, or the media sweeper will decide these files
+  /// are orphans and offer to delete them.
+  photos Json?
+
+  /// Local shops that donate get a badge rather than a separate type.
+  isDonor  Boolean @default(false)
+
+  status            PlaceStatus @default(PENDING)
+  reviewNote        String?     @db.Text
+  reviewedAt        DateTime?
+  reviewedByAdminId String?
+
+  // Submitter, loose FK plus a snapshot, same as events.
+  submittedByUserId String?
+  submitterSnapshot String? @db.VarChar(120)
+
+  // One chatroom per place, created on approval — ask a question
+  // before showing up.
+  chatRoomId String?
+
+  saveCount Int @default(0)
+  viewCount Int @default(0)
+
+  saves   PlaceSave[]
+  reports PlaceReport[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, type])
+  @@index([countryId, status])
+  // The map queries a bounding box; without this every pan is a scan.
+  @@index([status, latitude, longitude])
+  @@index([submittedByUserId])
+  @@map("places")
+}
+
+/// Why a member is flagging a listing. Not moderation reasons — nobody
+/// reports a food bank for hate speech. These are the ways a directory
+/// entry goes stale, which is the only thing that actually happens.
+enum PlaceReportKind {
+  CLOSED_DOWN
+  MOVED
+  WRONG_DETAILS
+  DUPLICATE
+  NOT_APPROPRIATE
+  OTHER
+}
+
+/// A member telling us an entry is wrong. Deliberately separate from
+/// PostReport: the action here is "go and check the place", not
+/// "moderate a person", and the two queues want different columns.
+model PlaceReport {
+  id      String          @id @default(cuid())
+  placeId String
+  kind    PlaceReportKind
+  /// What they say is wrong, or what it should say instead.
+  notes   String?         @db.Text
+
+  // Loose FK plus a snapshot, same convention as events and places:
+  // deleting the member leaves the report readable.
+  reporterId       String?
+  reporterSnapshot String? @db.VarChar(120)
+
+  status            ReportStatus @default(OPEN)
+  resolvedByAdminId String?
+  resolvedAt        DateTime?
+  resolution        String?      @db.Text
+
+  createdAt DateTime @default(now())
+
+  place Place @relation(fields: [placeId], references: [id], onDelete: Cascade)
+
+  // "What's open?" and "what has been said about this place?"
+  @@index([status, createdAt])
+  @@index([placeId, createdAt])
+  @@index([reporterId])
+  @@map("place_reports")
+}
+
+model PlaceSave {
+  placeId   String
+  userId    String
+  createdAt DateTime @default(now())
+
+  place Place @relation(fields: [placeId], references: [id], onDelete: Cascade)
+
+  @@id([placeId, userId])
+  @@index([userId, createdAt])
+  @@map("place_saves")
+}
+
+/// A member's saved filter set — "food banks and shelters near me".
+model PlaceFilterSet {
+  id      String @id @default(cuid())
+  userId  String
+  name    String @db.VarChar(80)
+  /// { types: PlaceType[], donorOnly?: boolean, countryId?: string, q?: string }
+  filters Json
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@map("place_filter_sets")
+}
+
+// ─── Live broadcasts ──────────────────────────────────────────────
+//
+// Anyone can go live. One person publishes from their browser over
+// WHIP; everybody else watches the same stream over HLS, relayed by
+// a MediaMTX server on its own host.
+//
+// ── THE SLUG IS NOT THE PASSWORD ──
+//
+// The reference implementation this was modelled on treats an
+// unguessable slug as the thing that authorises publishing. We don't:
+// the slug appears in a viewer's URL bar, in their history, and in
+// any link they paste. Publishing is authorised by a revocable grant;
+// the slug is only an address.
+//
+// ── WHAT THE MEDIA HOST CAN SEE ──
+//
+// Everything. WebRTC and HLS are both encrypted on the wire, but
+// MediaMTX decrypts and relays, so a broadcast is visible to anyone
+// with access to that machine, and so is every recording on its disk.
+// Treat that host as being as sensitive as this database.
+
+enum LiveStreamStatus {
+  /// Created, not broadcasting. The owner may still be setting up.
+  IDLE
+  LIVE
+  ENDED
+}
+
+enum LiveStreamVisibility {
+  /// Listed on /live and readable by anyone, signed in or not.
+  PUBLIC
+  /// Reachable only by someone who has the link.
+  UNLISTED
+}
+
+/// What a broadcast is about. Chosen by the streamer, browsable by
+/// everyone else.
+///
+/// Same shape as ChatCategory — admin-managed, slug-addressed, sorted
+/// by hand — with two additions the live grid actually uses: an emoji
+/// for the filter chip and an accent colour for the card badge.
+///
+/// `isActive` retires a category from the picker without detaching the
+/// streams already filed under it, which matters because deleting one
+/// would silently blank the category on past broadcasts.
+/// What an event IS — a walk, a fundraiser, a meeting.
+///
+/// Same shape as LiveCategory, and for the same reason: an emoji and
+/// an accent are what make a row of filter chips readable at a glance.
+///
+/// The point of seeding these before anybody has posted an event is
+/// that an empty calendar showing "Sober socials · Fundraisers ·
+/// Meetups · Workshops" tells someone what this place is for. An empty
+/// calendar showing nothing tells them to leave.
+model EventCategory {
+  id          String  @id @default(cuid())
+  name        String  @db.VarChar(80)
+  slug        String  @unique @db.VarChar(80)
+  description String? @db.VarChar(300)
+
+  emoji String? @db.VarChar(8)
+  /// Hex accent for the chip, e.g. "#0ea5e9".
+  color String? @db.VarChar(9)
+
+  sortOrder Int     @default(0)
+  isActive  Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  events Event[]
+
+  @@index([isActive, sortOrder])
+  @@map("event_categories")
+}
+
+model LiveCategory {
+  id          String  @id @default(cuid())
+  name        String  @db.VarChar(80)
+  slug        String  @unique @db.VarChar(80)
+  description String? @db.VarChar(300)
+
+  /// Rendered on the filter chip. One character; not validated beyond
+  /// length, because emoji are several code units and counting them
+  /// properly is not worth a schema rule.
+  emoji String? @db.VarChar(8)
+  /// Hex accent for the card badge, e.g. "#0ea5e9".
+  color String? @db.VarChar(9)
+
+  sortOrder Int     @default(0)
+  isActive  Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  streams LiveStream[]
+
+  @@index([isActive, sortOrder])
+  @@map("live_categories")
+}
+
+model LiveStream {
+  id   String @id @default(cuid())
+  /// The address, and only the address — see the note above.
+  slug String @unique @db.VarChar(40)
+
+  title   String  @db.VarChar(200)
+  summary String? @db.VarChar(400)
+
+  status     LiveStreamStatus     @default(IDLE)
+  visibility LiveStreamVisibility @default(PUBLIC)
+
+  // Loose FK plus snapshots, same as everywhere else: a deleted
+  // account must not take the broadcast record with it.
+  ownerUserId         String?
+  ownerNameSnapshot   String  @db.VarChar(120)
+  ownerAvatarSnapshot String?
+
+  countryId String?
+
+  /// REQUIRED when a member creates a stream — enforced in
+  /// createStream(), not by the column.
+  ///
+  /// Nullable on purpose. Broadcasts that already exist in production
+  /// predate categories, and a NOT NULL column would either fail the
+  /// migration outright or need every historical row backfilled into
+  /// a category nobody chose. Streams are ephemeral — an ENDED one is
+  /// just a record — so leaving old rows uncategorised costs nothing,
+  /// while SetNull keeps a retired category from blanking history.
+  categoryId String?
+  category   LiveCategory? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+
+  startedAt DateTime?
+  endedAt   DateTime?
+  endedBy   String?   @db.VarChar(24) // OWNER | ADMIN | LIMIT | STALE
+  endReason String?   @db.Text
+
+  /// Caps copied from settings when the stream is created, so an
+  /// admin changing the limits never cuts off a broadcast already in
+  /// progress.
+  maxDurationMin Int @default(120)
+
+  viewerCount Int @default(0)
+  viewerPeak  Int @default(0)
+  viewCount   Int @default(0)
+
+  recordingEnabled   Boolean   @default(false)
+  recordingStartedAt DateTime?
+  recordingStoppedAt DateTime?
+  /// Set by the retention sweep so the row survives the media.
+  recordingDeletedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  grants   LiveStreamGrant[]
+  comments LiveComment[]
+
+  @@index([status, startedAt])
+  @@index([visibility, status, startedAt])
+  @@index([ownerUserId, createdAt])
+  @@index([countryId, status])
+  // The browse query: this category, live now, newest first.
+  @@index([categoryId, status, startedAt])
+  @@map("live_streams")
+}
+
+/// One message in a broadcast's live chat.
+///
+/// SEPARATE FROM ChatMessage ON PURPOSE. A chat room is a place that
+/// persists and has membership, moderation queues, reactions, replies
+/// and reports hanging off it. A live comment is a remark made during
+/// one broadcast — it has no thread, no membership to check, and its
+/// entire lifetime is the stream's. Borrowing ChatMessage would mean
+/// every chatroom query growing an `OR roomId IS NULL` and every
+/// broadcast carrying a phantom room row.
+///
+/// Snapshots, and a loose FK, for the same reason as the stream
+/// itself: deleting an account must not delete the record of what was
+/// said during someone else's broadcast.
+model LiveComment {
+  id String @id @default(cuid())
+
+  streamId String
+  stream   LiveStream @relation(fields: [streamId], references: [id], onDelete: Cascade)
+
+  authorUserId         String?
+  authorNameSnapshot   String  @db.VarChar(120)
+  authorAvatarSnapshot String?
+
+  body String @db.VarChar(500)
+
+  /// Set when the author, the broadcaster or an admin removes it. The
+  /// row stays so the count and the moderation trail survive.
+  removedAt     DateTime?
+  removedBy     String?   @db.VarChar(24) // AUTHOR | OWNER | ADMIN
+  removedReason String?   @db.Text
+
+  createdAt DateTime @default(now())
+
+  /// The read path is always "this stream, newest first, not removed",
+  /// and the SSE tail is "this stream, newer than a cursor". One index
+  /// serves both.
+  @@index([streamId, createdAt])
+  @@index([authorUserId, createdAt])
+  @@map("live_comments")
+}
+
+/// A revocable ticket to PUBLISH one broadcast.
+///
+/// Only ever issued to the owner. Viewers have no grant at all —
+/// there is no way to mint one per anonymous viewer, so reading a
+/// public stream is authorised by the stream's own visibility.
+model LiveStreamGrant {
+  token String @id @db.VarChar(64)
+
+  streamId String
+  stream   LiveStream @relation(fields: [streamId], references: [id], onDelete: Cascade)
+
+  userId String
+
+  expiresAt DateTime
+  revokedAt DateTime?
+
+  lastUsedAt DateTime?
+  useCount   Int       @default(0)
+  lastIp     String?   @db.VarChar(64)
+
+  createdAt DateTime @default(now())
+
+  @@unique([streamId, userId])
+  @@index([streamId])
+  @@index([expiresAt])
+  @@map("live_stream_grants")
+}
+
+// ═══════════════════════════════════════════════════════════════
+// DONATIONS & PAYOUTS
+// ═══════════════════════════════════════════════════════════════
+//
+// Money is stored as INTEGER MINOR UNITS (cents) everywhere. Never a
+// float, never a Decimal-as-string. 0.1 + 0.2 is not 0.3 in binary
+// floating point, and money that is one cent wrong is a support ticket
+// and, eventually, a reconciliation nightmare.
+//
+// Currency is a column rather than an assumption even though only USD
+// is enabled today — retrofitting currency onto a single-currency
+// ledger means rewriting every sum in the system.
+//
+// Donations are collected into WorldWeCare's own Stripe account and
+// earmarked for a recipient, who requests a manual payout. The
+// platform fee is taken on the way OUT, at payout time.
+
+enum DonationStatus {
+  /// Checkout started, money not confirmed. Never counts toward a balance.
+  PENDING
+  SUCCEEDED
+  /// Refunded in full or in part; see refundedCents.
+  REFUNDED
+  FAILED
+  /// The donor's bank has disputed the charge (a chargeback).
+  ///
+  /// Stripe removes the money from the platform's balance the moment
+  /// a dispute opens, so this status must NEVER count toward anyone's
+  /// balance — otherwise a member can withdraw money the platform no
+  /// longer holds. `balanceFor` counts only SUCCEEDED and REFUNDED,
+  /// which is exactly why moving a row here reverses the credit.
+  ///
+  /// Winning the dispute moves it back to SUCCEEDED. Losing leaves it
+  /// here, which reads correctly: the money is gone.
+  DISPUTED
+}
+
+model Donation {
+  id String @id @default(cuid())
+
+  // ── Stripe identity ──
+  // Both unique: the webhook can be delivered more than once, and
+  // uniqueness is what makes recording idempotent at the database
+  // level rather than relying on the handler getting it right.
+  stripeSessionId       String? @unique @db.VarChar(255)
+  stripePaymentIntentId String? @unique @db.VarChar(255)
+  stripeChargeId        String? @db.VarChar(255)
+
+  // ── the money, in cents ──
+  /// What the donor was charged.
+  grossCents       Int
+  /// Stripe's processing fee, read from the balance transaction — the
+  /// REAL number, not 2.9% + 30¢ recomputed here and quietly wrong for
+  /// international cards, Amex, or a negotiated rate.
+  stripeFeeCents   Int    @default(0)
+  /// Taken by the platform at donation time. Usually 0 — the standing
+  /// arrangement takes the platform's cut at payout instead — but the
+  /// column exists so that policy can change without a migration.
+  platformFeeCents Int    @default(0)
+  /// What actually credits the recipient's balance.
+  netCents         Int
+  /// Refunded so far. Subtracted from the recipient's balance.
+  refundedCents    Int    @default(0)
+  currency         String @default("usd") @db.VarChar(3)
+
+  // ── who gave ──
+  /// Null for a signed-out donor. Loose FK: deleting an account must
+  /// not delete the financial record of a payment that really happened.
+  donorUserId       String?
+  donorNameSnapshot String? @db.VarChar(120)
+  /// For the receipt. Stripe has it too; kept here so the admin can
+  /// answer "who was this from" without opening the dashboard.
+  donorEmail        String? @db.VarChar(320)
+  isAnonymous       Boolean @default(false)
+  /// A note from the donor, shown to the recipient.
+  message           String? @db.VarChar(500)
+
+  // ── who it was for ──
+  /// The member the donation was earmarked to. Null means it was given
+  /// to WorldWeCare itself and credits nobody's balance.
+  recipientUserId       String?
+  recipientNameSnapshot String? @db.VarChar(120)
+  /// Optional campaign the donation was made against.
+  campaignId            String?
+  /// Optional event the donation was made against. The recipient is
+  /// the event's host, so this is about WHY the money was given rather
+  /// than who got it.
+  eventId               String?
+  /// The campaign or event title, frozen. "You gave $25" is a much
+  /// worse history line than "You gave $25 to Beach Cleanup", and a
+  /// join to fetch it would break the moment the event is deleted.
+  causeTitleSnapshot    String? @db.VarChar(200)
+
+  status DonationStatus @default(PENDING)
+
+  /// When this money becomes withdrawable — set to now + the hold
+  /// period on success. The hold exists so a refund or chargeback
+  /// can't arrive after the recipient has already been paid out,
+  /// leaving a balance that cannot go negative but really should.
+  availableAt DateTime?
+
+  succeededAt DateTime?
+  refundedAt  DateTime?
+  failedAt    DateTime?
+  /// True when Stripe's real processing fee could not be read at the
+  /// time of crediting. The donation is still credited — the money is
+  /// real — but with `creditRecipient: "net"` the recipient was given
+  /// the full gross and the platform quietly absorbed the fee. The
+  /// admin donations list surfaces these so it is a decision rather
+  /// than a silent loss.
+  feeUnknown  Boolean   @default(false)
+
+  /// When a chargeback was opened. Kept after a won dispute, so the
+  /// history of a contested donation survives the status going back
+  /// to SUCCEEDED.
+  disputedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// The balance query: this recipient, succeeded, past its hold.
+  @@index([recipientUserId, status, availableAt])
+  /// The donor's own history page.
+  @@index([donorUserId, createdAt])
+  /// Admin listing and campaign totals.
+  @@index([status, createdAt])
+  /// Dispute events identify a charge, not a payment intent — this is
+  /// the first thing that reads stripeChargeId at all.
+  @@index([stripeChargeId])
+  @@index([campaignId, status])
+  @@index([eventId, status])
+  @@map("donations")
+}
+
+enum PayoutMethodType {
+  PAYPAL
+  BANK
+  WISE
+  /// Posted cheque — some members have no account to pay into.
+  CHECK
+}
+
+/// Where one member wants to be paid.
+///
+/// `details` is ENCRYPTED (see lib/secret-box.ts). Bank numbers sitting
+/// in plaintext in MySQL are the kind of thing that turns a read-only
+/// SQL injection into a disclosure incident, and they are of no use to
+/// the application except at the moment an admin is sending money.
+///
+/// `displayHint` is the safe-to-render version — "PayPal · a…@gmail.com",
+/// "Bank ····4321" — computed once on save so no read path ever needs
+/// to decrypt just to draw a list.
+model PayoutMethod {
+  id     String           @id @default(cuid())
+  userId String
+  user   User             @relation("UserPayoutMethods", fields: [userId], references: [id], onDelete: Cascade)
+  type   PayoutMethodType
+
+  /// Member's own name for it — "My PayPal", "Joint account".
+  label String? @db.VarChar(80)
+
+  /// Sealed JSON. Shape depends on `type`; validated at the API edge.
+  details String @db.Text
+
+  /// Never sensitive. Safe to show anywhere.
+  displayHint String @db.VarChar(120)
+
+  isDefault Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  payouts Payout[]
+
+  @@index([userId, isDefault])
+  @@map("payout_methods")
+}
+
+enum PayoutStatus {
+  /// Member asked; the money is reserved against their balance.
+  REQUESTED
+  /// Admin accepted it but hasn't sent the money yet.
+  APPROVED
+  /// Money sent. Terminal.
+  PAID
+  /// Admin declined; the reservation is released. Terminal.
+  REJECTED
+  /// Member withdrew the request before it was actioned. Terminal.
+  CANCELLED
+}
+
+/// One withdrawal request.
+///
+/// Amounts are frozen at request time: the fee percentage in force
+/// then is stored on the row, so changing the platform fee later never
+/// silently re-prices a request an admin already approved.
+model Payout {
+  id String @id @default(cuid())
+
+  /// Loose FK, like Donation: a payment record outlives the account.
+  userId            String
+  userNameSnapshot  String  @db.VarChar(120)
+  userEmailSnapshot String? @db.VarChar(320)
+
+  /// Gross taken off the member's balance.
+  amountCents    Int
+  /// Fee rate applied, in BASIS POINTS — 100 = 1%. An integer, so the
+  /// stored rate is exact; a float percentage would reintroduce the
+  /// rounding problem this whole schema avoids.
+  feeBasisPoints Int
+  /// Fee in cents, computed once at request time and stored.
+  feeCents       Int
+  /// What the member actually receives. amountCents - feeCents.
+  netCents       Int
+  currency       String @default("usd") @db.VarChar(3)
+
+  /// Nullable so deleting a payout method never deletes payout history.
+  methodId       String?
+  method         PayoutMethod? @relation(fields: [methodId], references: [id], onDelete: SetNull)
+  /// Frozen copy of the method — type, label, displayHint — so a paid
+  /// payout still says where the money went after the member has
+  /// deleted or changed the account.
+  methodSnapshot Json
+
+  status PayoutStatus @default(REQUESTED)
+
+  requestedAt DateTime  @default(now())
+  reviewedAt  DateTime?
+  paidAt      DateTime?
+
+  reviewedByAdminId String?
+  /// Admin-only working note.
+  adminNote         String? @db.Text
+  /// Shown to the member when declined. Required by the API on reject.
+  rejectionReason   String? @db.Text
+  /// PayPal transaction id, bank reference, cheque number — whatever
+  /// the admin has to point at afterwards.
+  externalRef       String? @db.VarChar(160)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// The reservation query — everything not yet terminal for this member.
+  @@index([userId, status])
+  /// The admin queue, oldest request first.
+  @@index([status, requestedAt])
+  @@map("payouts")
+}
+
+// ─────────────────────────────────────────────────────────────────
+// TOWN HEROES
+//
+// The people in a town who quietly do the work — the woman who runs
+// the food bank out of her garage, the man who walks other people's
+// dogs when they are too unwell to. Members NOMINATE them; an admin
+// approves before anything is public.
+//
+// WHY A MODEL AND NOT AN ARTICLE CATEGORY. The first plan was to make
+// this a category of Article, which would have cost nothing. It was
+// dropped because a hero is a PERSON, not a piece of writing: the
+// tiles have to say "Marie · Cork" the same way every time, the page
+// has to be filterable by town, and neither survives being encoded in
+// a headline. And an Article is authored by an admin, whereas the
+// whole point here is that the community does the finding.
+//
+// The nominee is not a User and must never be assumed to be one.
+// Nobody is asked to sign up to be thanked, and a hero who has never
+// heard of the site still belongs on it.
+// ─────────────────────────────────────────────────────────────────
+
+enum TownHeroStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+/// What KIND of quiet work this is — the food bank, the dog walks, the
+/// homework club. Admin-managed and closed, the same as event and live
+/// categories: a taxonomy anyone can extend from a submission form
+/// stops being a taxonomy by about the fortieth nomination.
+model TownHeroCategory {
+  id          String  @id @default(cuid())
+  name        String  @db.VarChar(80)
+  slug        String  @unique @db.VarChar(80)
+  description String? @db.VarChar(300)
+
+  emoji String? @db.VarChar(8)
+  /// Hex accent for the tile, e.g. "#f59e0b".
+  color String? @db.VarChar(9)
+
+  sortOrder Int     @default(0)
+  /// Retire rather than delete: heroes already filed under it keep
+  /// their label, and the tile simply stops being offered.
+  isActive  Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  heroes TownHero[]
+
+  @@index([isActive, sortOrder])
+  @@map("town_hero_categories")
+}
+
+model TownHero {
+  id   String @id @default(cuid())
+  slug String @unique
+
+  // ── who they are ──
+  /// The nominee's name as the nominator wrote it. NOT a User.
+  heroName String  @db.VarChar(120)
+  /// Free text, deliberately. "Cork", "Blackpool", "the north side"
+  /// — a nominator should not have to find their town in a dropdown
+  /// before they can say thank you.
+  town     String? @db.VarChar(120)
+  /// Optional scope so /town-heroes can narrow like events and
+  /// petitions do. Loose, like Place and Event — no relation.
+  countryId String?
+
+  /// REQUIRED. Every hero is filed under something.
+  ///
+  /// This started optional, on the reasoning that a nomination should
+  /// never fail because somebody could not decide which box it went
+  /// in. It is required now by decision, and the cost is paid in the
+  /// seed rather than by the nominator: there is an "Anything else"
+  /// category, so the picker always has a right answer and nobody is
+  /// stuck staring at a form they cannot submit.
+  ///
+  /// `Restrict`, not `SetNull` — SetNull cannot satisfy a required
+  /// column, and Cascade would delete PEOPLE because an admin tidied
+  /// up a settings screen. Deleting a category in use is refused at
+  /// the database as well as in `deleteHeroCategory`.
+  categoryId String
+  category   TownHeroCategory @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+
+  photoUrl String?
+  photoAlt String? @db.VarChar(300)
+
+  // ── the story ──
+  /// One line for the tile: "Runs the Tuesday soup run."
+  summary String? @db.VarChar(400)
+  /// Why they are a hero. Markdown, same as articles.
+  body    String  @db.Text
+
+  // ── who nominated them ──
+  // Loose FK plus a snapshot, the house pattern: the nomination has
+  // to keep reading correctly after the nominator deletes their
+  // account, and it must not become a broken join.
+  nominatedByUserId    String?
+  nominatorSnapshot    String? @db.VarChar(120)
+  /// The nominator can stay out of it. Redacted on the way out, never
+  /// at rest — a moderator still has to be able to see who sent it.
+  isAnonymous          Boolean @default(false)
+
+  // ── moderation ──
+  status          TownHeroStatus @default(PENDING)
+  rejectionReason String?        @db.Text
+  reviewedAt      DateTime?
+  reviewedByAdminId String?
+  /// Stamped on the first APPROVED transition and never moved after,
+  /// like Article.publishedAt — re-approving an edited hero must not
+  /// shove it back to the top of the list.
+  approvedAt      DateTime?
+
+  isFeatured Boolean   @default(false)
+  featuredAt DateTime?
+
+  heartCount Int             @default(0)
+  hearts     TownHeroHeart[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// The public list, newest approved first.
+  @@index([status, approvedAt])
+  /// The same list narrowed to a country.
+  @@index([countryId, status, approvedAt])
+  /// And to a category.
+  @@index([categoryId, status, approvedAt])
+  /// The admin queue, and "my nominations".
+  @@index([nominatedByUserId])
+  @@index([isFeatured, featuredAt])
+  @@map("town_heroes")
+}
+
+model TownHeroHeart {
+  heroId    String
+  userId    String
+  createdAt DateTime @default(now())
+
+  hero TownHero @relation(fields: [heroId], references: [id], onDelete: Cascade)
+
+  @@id([heroId, userId])
+  @@index([userId])
+  @@map("town_hero_hearts")
+}

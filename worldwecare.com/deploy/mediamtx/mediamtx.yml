@@ -1,0 +1,139 @@
+###############################################################################
+# MediaMTX for WorldWeCare live broadcasts
+#
+# Anyone can go live. One person publishes over WHIP; everybody else
+# watches the same stream over HLS. This server holds no list of who
+# may do either — every publish is referred back to the app, which
+# answers from a grant it issued.
+#
+# THE THREE THINGS THAT MAKE THIS SAFE, AND WHY:
+#
+#   1. authMethod: http — MediaMTX asks the app before it lets anyone
+#      publish or read. Change this to "internal" and every session
+#      becomes open to anyone who can guess a path.
+#
+#   2. The broadcast path is a REGEX with record: no. Streams are
+#      never pre-created here; the app adds a concrete path entry only
+#      when recording is switched on, and deletes it when it stops. A
+#      default of `record: yes` would record every broadcast whether
+#      anybody asked for it or not.
+#
+#   3. authInternalUsers still exists, for the Control API only. The
+#      app authenticates to it with these credentials. It is excluded
+#      from the HTTP hook because the hook is about streams, not
+#      administration.
+###############################################################################
+
+logLevel: info
+logDestinations: [stdout]
+
+# ── Control API ──────────────────────────────────────────────────
+# The app calls this to start/stop recording and to disconnect a
+# participant. Bind it to the interface the app reaches, and put TLS
+# in front of it — these credentials are as good as the server.
+api: yes
+apiAddress: :9997
+apiAllowOrigins: []
+
+# ── HLS, what a broadcast audience watches ───────────────────────
+# Broadcasts go out over HLS, not WebRTC: WebRTC needs a peer
+# connection per viewer and this server would carry every one of them,
+# while HLS is a file any proxy or CDN can hand to a thousand people.
+# The cost is a few seconds of latency, which nobody watching a talk
+# notices — one-to-one sessions stay on WebRTC, where they would.
+hls: yes
+hlsAddress: :8888
+hlsVariant: lowLatency
+hlsAlwaysRemux: yes          # produce HLS from the first frame, not the first viewer
+hlsSegmentCount: 7
+hlsSegmentDuration: 1s
+hlsAllowOrigins: ["https://worldwecare.com"]
+
+# ── Playback, for watching a recording back ──────────────────────
+playback: yes
+playbackAddress: :9996
+
+# ── WebRTC ───────────────────────────────────────────────────────
+# 8889 is the WHIP/WHEP signalling port; 8189/udp carries the media.
+# Both must be reachable. If 8189 is closed a session will connect,
+# show two black rectangles, and never explain why.
+# Only publishers use WebRTC; the audience is on HLS.
+webrtc: yes
+webrtcAddress: :8889
+# Every origin that may reach WHIP from a browser. A list, and the
+# key is PLURAL — MediaMTX refuses to start on an unknown field, so a
+# singular `webrtcAllowOrigin` here is a server that never comes up.
+#
+# A missing origin is not an error you can see from the server side:
+# the browser reports it as "No 'Access-Control-Allow-Origin' header
+# is present", which reads like the header is missing entirely rather
+# than that yours was not on the list.
+#
+# Add http://localhost:3000 to develop against this server, and take
+# it out again before the host carries anything real.
+webrtcAllowOrigins: ["https://worldwecare.com"]
+webrtcLocalUDPAddress: :8189
+webrtcIPsFromInterfaces: yes
+# On a cloud host behind NAT, the interface addresses are private and
+# useless to a browser. Put the PUBLIC address here or nothing will
+# ever connect from outside.
+webrtcAdditionalHosts: []
+webrtcICEServers2:
+  - url: stun:stun.l.google.com:19302
+
+# Protocols we do not use. Off, because a port that is open is a port
+# that can be published to. Turn rtmp on only if you decide to let
+# people broadcast from OBS — and note that RTMP has no equivalent of
+# the WHIP Authorization header, so the auth hook would see no token.
+rtsp: no
+rtmp: no
+srt: no
+
+# ── Authentication ───────────────────────────────────────────────
+authMethod: http
+authHTTPAddress: https://worldwecare.com/api/mediamtx/auth
+# The app never authorises these over the hook — they are the Control
+# API's own business and use the internal user below.
+authHTTPExclude:
+  - action: api
+  - action: metrics
+  - action: pprof
+
+authInternalUsers:
+  # The app's Control API account. Nothing else.
+  - user: wwc-api
+    pass: CHANGE-ME
+    ips: []
+    permissions:
+      - action: api
+
+# ── Paths ────────────────────────────────────────────────────────
+pathDefaults:
+  record: no
+  recordFormat: fmp4
+  recordPath: /var/lib/mediamtx/recordings/%path/%Y-%m-%d_%H-%M-%S-%f
+  recordSegmentDuration: 1h
+  # Seven days. Long enough to be useful, short enough that a
+  # recording nobody asked to keep does not live forever.
+  recordDeleteAfter: 168h
+
+paths:
+  # ── Broadcasts ──
+  # "live/live-<32 hex>". MUST match the path prefix set in the app at
+  # Settings → Live streaming: a prefix configured there and not here
+  # means every broadcast is refused by this server, and the only
+  # symptom the broadcaster sees is a failure to connect.
+  #
+  # The slug in the name is an address, not a credential — the app
+  # still authorises every publish through the hook above. Reading is
+  # where the two differ: the hook allows an anonymous viewer on a
+  # live public stream, because there is no token to give a viewer.
+  ~^live/live-[a-f0-9]{32}$:
+    record: no
+    # Drop the path a minute after the broadcaster disconnects, so a
+    # dead stream stops being listed.
+    runOnDemandCloseAfter: 60s
+
+  # No catch-all. Without an all_others entry MediaMTX refuses paths
+  # that match nothing, which is the behaviour we want: a stranger
+  # publishing to /whatever gets nowhere.
