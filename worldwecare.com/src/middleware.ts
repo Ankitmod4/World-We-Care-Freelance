@@ -69,7 +69,56 @@ function exempt(pathname: string): boolean {
   );
 }
 
+/**
+ * DEV ONLY: CORS for the Expo web build of the mobile app.
+ *
+ * `npx expo start --web` serves the app from another port (8081), so the
+ * browser treats calls to this API as cross-origin and blocks them, and
+ * with them the cookie session. Allowed origins come from
+ * DEV_CORS_ORIGINS (comma-separated), defaulting to the Expo dev ports.
+ * Never active in production. Native iOS/Android builds don't need it.
+ */
+const DEV_CORS_ORIGINS =
+  process.env.NODE_ENV === "production"
+    ? []
+    : (process.env.DEV_CORS_ORIGINS ?? "http://localhost:8081,http://127.0.0.1:8081")
+        .split(",")
+        .map((o) => o.trim())
+        .filter(Boolean);
+
+function corsOrigin(req: NextRequest): string | null {
+  if (!req.nextUrl.pathname.startsWith("/api/")) return null;
+  const origin = req.headers.get("origin");
+  if (!origin || process.env.NODE_ENV === "production") return null;
+  // Any local Expo web port (8081, 8082, …) plus anything in DEV_CORS_ORIGINS.
+  const isLocal = /^http:\/\/(localhost|127\.0\.0\.1):\d+$/.test(origin);
+  return isLocal || DEV_CORS_ORIGINS.includes(origin) ? origin : null;
+}
+
+function withCors(res: NextResponse, origin: string | null): NextResponse {
+  if (!origin) return res;
+  res.headers.set("Access-Control-Allow-Origin", origin);
+  res.headers.set("Access-Control-Allow-Credentials", "true");
+  res.headers.set("Vary", "Origin");
+  return res;
+}
+
 export async function middleware(req: NextRequest) {
+  const origin = corsOrigin(req);
+  if (origin && req.method === "OPTIONS") {
+    const preflight = new NextResponse(null, { status: 204 });
+    preflight.headers.set("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
+    preflight.headers.set(
+      "Access-Control-Allow-Headers",
+      req.headers.get("access-control-request-headers") ?? "Content-Type, Accept",
+    );
+    preflight.headers.set("Access-Control-Max-Age", "600");
+    return withCors(preflight, origin);
+  }
+  return withCors(await gate(req), origin);
+}
+
+async function gate(req: NextRequest): Promise<NextResponse> {
   const { pathname } = req.nextUrl;
 
   /* ── 1. admin ──────────────────────────────────────────────── */
